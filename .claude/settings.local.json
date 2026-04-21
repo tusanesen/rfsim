@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import numpy, scipy, matplotlib; print\\('numpy:', numpy.__version__\\); print\\('scipy:', scipy.__version__\\); print\\('matplotlib:', matplotlib.__version__\\)\")",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(echo \"EXIT:$?\")"
+    ]
+  }
+}
