@@ -1,142 +1,153 @@
 """
-AM Modulation RF Simulation
-Multiple AM signals with different carrier frequencies around 150 MHz
+AM Modulation RF Simulation — Live Streaming Spectrum Analyzer
+5 AM channels, continuously updated FFT display + rolling time-domain strip
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.animation import FuncAnimation
 
-# ─── Simulation Parameters ───────────────────────────────────────────────────
-FS = 2e9          # Sample rate: 2 GHz (must be > 2x highest carrier)
-DURATION = 1e-4   # 100 µs capture window
-N = int(FS * DURATION)
+# ─── Parameters ──────────────────────────────────────────────────────────────
+FS        = 500_000      # Sample rate: 500 kHz
+N_FFT     = 4096         # FFT size → ~122 Hz/bin resolution
+CHUNK     = 512          # New samples per animation frame (87.5% overlap)
+INTERVAL  = 33           # ms between frames (~30 fps)
+F_LO      = 40_000       # Display window low edge (Hz)
+F_HI      = 240_000      # Display window high edge (Hz)
+NOISE_STD = 0.015        # AWGN amplitude → ~−75 dBFS noise floor after FFT
+TD_SECS   = 0.010        # Time-domain strip length: 10 ms
 
-t = np.linspace(0, DURATION, N, endpoint=False)
-
-# ─── AM Signal Definitions ───────────────────────────────────────────────────
-# Each entry: (carrier_freq_MHz, modulation_freq_kHz, mod_index, label)
+# carrier_hz, mod_hz, mod_index, label
 SIGNALS = [
-    (147.5e6,  1.0e3, 0.5,  "CH1 - 147.5 MHz"),
-    (149.0e6,  2.5e3, 0.7,  "CH2 - 149.0 MHz"),
-    (150.5e6,  5.0e3, 0.4,  "CH3 - 150.5 MHz"),
-    (152.0e6, 10.0e3, 0.8,  "CH4 - 152.0 MHz"),
-    (153.5e6,  3.0e3, 0.6,  "CH5 - 153.5 MHz"),
+    ( 60_000,  1_000, 0.50, "CH1"),
+    ( 90_000,  2_500, 0.70, "CH2"),
+    (130_000,  5_000, 0.40, "CH3"),
+    (170_000, 10_000, 0.80, "CH4"),
+    (210_000,  3_000, 0.60, "CH5"),
 ]
-
 COLORS = ["#00BFFF", "#FF6B6B", "#00FF9F", "#FFD700", "#BF5FFF"]
 
-# ─── Generate AM Signals ──────────────────────────────────────────────────────
-def am_signal(t, fc, fm, m):
-    """
-    AM signal: s(t) = [1 + m·cos(2π·fm·t)] · cos(2π·fc·t)
-    fc  = carrier frequency
-    fm  = modulating (audio) frequency
-    m   = modulation index (0 < m ≤ 1)
-    """
-    carrier   = np.cos(2 * np.pi * fc * t)
-    modulator = 1 + m * np.cos(2 * np.pi * fm * t)
-    return modulator * carrier
+# Precompute frequency-bin mask for the display window
+_freqs_all = np.fft.rfftfreq(N_FFT, 1 / FS)
+_mask      = (_freqs_all >= F_LO) & (_freqs_all <= F_HI)
+FREQS_KHZ  = _freqs_all[_mask] / 1000.0   # display in kHz, computed once
 
-composite = np.zeros(N)
-signals   = []
+TD_SAMPLES = int(FS * TD_SECS)
 
-for fc, fm, m, label in SIGNALS:
-    s = am_signal(t, fc, fm, m)
-    signals.append(s)
-    composite += s
 
-# ─── FFT ─────────────────────────────────────────────────────────────────────
-def compute_fft(x, fs):
-    win      = np.blackman(len(x))           # Blackman window → lower sidelobes
-    X        = np.fft.rfft(x * win)
-    freqs    = np.fft.rfftfreq(len(x), 1/fs)
-    mag_db   = 20 * np.log10(np.abs(X) / len(x) + 1e-12)
-    return freqs, mag_db
+# ─── Signal generation ────────────────────────────────────────────────────────
+def generate_chunk(t_offset: float) -> np.ndarray:
+    """Generate CHUNK samples of composite AM + AWGN, phase-continuous across calls."""
+    t = np.arange(CHUNK) / FS + t_offset
+    composite = np.zeros(CHUNK)
+    for fc, fm, m, _ in SIGNALS:
+        composite += (1 + m * np.cos(2 * np.pi * fm * t)) * np.cos(2 * np.pi * fc * t)
+    composite += np.random.randn(CHUNK) * NOISE_STD
+    return composite
 
-freqs, composite_db = compute_fft(composite, FS)
 
-# Frequency range to display: 145 – 156 MHz
-f_lo, f_hi = 145e6, 156e6
-mask = (freqs >= f_lo) & (freqs <= f_hi)
-f_view   = freqs[mask]
-db_view  = composite_db[mask]
+# ─── Spectrum computation ─────────────────────────────────────────────────────
+def compute_spectrum(ring: np.ndarray):
+    """Blackman-windowed rfft on the ring buffer → dBFS, sliced to display window."""
+    win    = np.blackman(N_FFT)
+    X      = np.fft.rfft(ring * win)
+    mag_db = 20 * np.log10(np.abs(X) / N_FFT + 1e-12)
+    return mag_db[_mask]
 
-# Per-channel FFTs for the individual-channel subplot
-channel_ffts = []
-for s in signals:
-    _, db = compute_fft(s, FS)
-    channel_ffts.append(db[mask])
 
-# ─── Plot ─────────────────────────────────────────────────────────────────────
-plt.style.use("dark_background")
-fig = plt.figure(figsize=(16, 10), facecolor="#0d0d0d")
-fig.suptitle("AM RF Simulation  ·  Carriers around 150 MHz",
-             fontsize=15, color="white", y=0.98)
+# ─── Figure setup ─────────────────────────────────────────────────────────────
+def build_figure():
+    plt.style.use("dark_background")
+    fig = plt.figure(figsize=(14, 7), facecolor="#0d0d0d")
+    fig.suptitle("AM Spectrum Analyzer  ·  Live",
+                 fontsize=13, color="white", y=0.99)
 
-gs = gridspec.GridSpec(3, 2, figure=fig,
-                       hspace=0.55, wspace=0.35,
-                       left=0.07, right=0.97, top=0.93, bottom=0.07)
+    gs = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[7, 3],
+                           hspace=0.35, left=0.07, right=0.97, top=0.94, bottom=0.08)
 
-# 1) Composite FFT spectrum (spans full width, top row)
-ax_main = fig.add_subplot(gs[0, :])
-ax_main.plot(f_view / 1e6, db_view, color="#00BFFF", linewidth=1.0, label="Composite")
-ax_main.set_title("Composite FFT Spectrum", color="white", fontsize=11)
-ax_main.set_xlabel("Frequency (MHz)", color="gray")
-ax_main.set_ylabel("Power (dBFS)", color="gray")
-ax_main.tick_params(colors="gray")
-ax_main.set_facecolor("#111111")
-ax_main.grid(True, color="#2a2a2a", linewidth=0.6)
-ax_main.set_xlim(f_lo / 1e6, f_hi / 1e6)
-ax_main.set_ylim(-90, 10)
+    # ── Spectrum panel ──
+    ax_spec = fig.add_subplot(gs[0])
+    ax_spec.set_facecolor("#111111")
+    ax_spec.set_xlim(F_LO / 1000, F_HI / 1000)
+    ax_spec.set_ylim(-90, 10)
+    ax_spec.set_xlabel("Frequency (kHz)", color="gray")
+    ax_spec.set_ylabel("Power (dBFS)", color="gray")
+    ax_spec.tick_params(colors="gray")
+    ax_spec.grid(True, color="#2a2a2a", linewidth=0.6)
 
-# Annotate carrier peaks
-for (fc, fm, m, label), color in zip(SIGNALS, COLORS):
-    ax_main.axvline(fc / 1e6, color=color, linestyle="--", alpha=0.5, linewidth=0.8)
-    ax_main.text(fc / 1e6, 5, f"{fc/1e6:.1f}", color=color,
-                 fontsize=7.5, ha="center", va="bottom", rotation=90)
+    for (fc, fm, m, label), color in zip(SIGNALS, COLORS):
+        ax_spec.axvline(fc / 1000, color=color, linestyle="--", alpha=0.5, linewidth=0.8)
+        ax_spec.text(fc / 1000, 5, f"{fc/1000:.0f} kHz\n{label}",
+                     color=color, fontsize=7.5, ha="center", va="bottom")
 
-# 2) Individual channel spectra (rows 1–2, two columns)
-axes = [fig.add_subplot(gs[1, 0]), fig.add_subplot(gs[1, 1]),
-        fig.add_subplot(gs[2, 0]), fig.add_subplot(gs[2, 1])]
+    spec_line, = ax_spec.plot([], [], color="#00BFFF", linewidth=0.9, animated=True)
 
-# Use only 4 slots; CH5 overlays on main (add a 5th subplot if needed)
-for i in range(min(4, len(SIGNALS))):
-    ax = axes[i]
-    fc, fm, m, label = SIGNALS[i]
-    ax.plot(f_view / 1e6, channel_ffts[i], color=COLORS[i], linewidth=0.9)
-    ax.set_title(f"{label}  (m={m}, fm={fm/1e3:.1f} kHz)",
-                 color=COLORS[i], fontsize=9)
-    ax.set_xlabel("Frequency (MHz)", color="gray", fontsize=8)
-    ax.set_ylabel("dBFS", color="gray", fontsize=8)
-    ax.tick_params(colors="gray", labelsize=7)
-    ax.set_facecolor("#111111")
-    ax.grid(True, color="#2a2a2a", linewidth=0.5)
-    ax.set_xlim(f_lo / 1e6, f_hi / 1e6)
-    ax.set_ylim(-90, 10)
-    # Mark carrier + sidebands
-    ax.axvline(fc / 1e6, color=COLORS[i], linestyle="--", alpha=0.7, linewidth=0.8)
-    ax.axvline((fc + fm) / 1e6, color="white", linestyle=":", alpha=0.4, linewidth=0.7)
-    ax.axvline((fc - fm) / 1e6, color="white", linestyle=":", alpha=0.4, linewidth=0.7)
+    # ── Time-domain panel ──
+    ax_td = fig.add_subplot(gs[1])
+    ax_td.set_facecolor("#0a0a0a")
+    t_ms = np.linspace(0, TD_SECS * 1000, TD_SAMPLES)
+    ax_td.set_xlim(0, TD_SECS * 1000)
+    ax_td.set_ylim(-6, 6)
+    ax_td.set_xlabel("Time (ms)", color="gray", fontsize=9)
+    ax_td.set_ylabel("Amplitude", color="gray", fontsize=9)
+    ax_td.tick_params(colors="gray", labelsize=7)
+    ax_td.grid(True, color="#222222", linewidth=0.4)
+    ax_td.set_title("Composite waveform (rolling 10 ms)", color="#888888", fontsize=8)
 
-# 5th channel sits in ax_main legend area — add text annotation instead
-ax_main.plot(f_view / 1e6, channel_ffts[4], color=COLORS[4],
-             linewidth=0.7, alpha=0.6, linestyle="-", label=SIGNALS[4][3])
-ax_main.legend(loc="upper right", fontsize=8, facecolor="#1a1a1a",
-               edgecolor="#333", labelcolor="white")
+    td_line, = ax_td.plot(t_ms, np.zeros(TD_SAMPLES),
+                          color="#00FF9F", linewidth=0.5, animated=True)
 
-# ─── Time-domain inset (small, inside composite plot) ────────────────────────
-ax_td = ax_main.inset_axes([0.01, 0.05, 0.18, 0.45])
-t_us   = t * 1e6
-n_show = int(FS * 10e-6)   # show 10 µs
-ax_td.plot(t_us[:n_show], composite[:n_show], color="#00BFFF", linewidth=0.4)
-ax_td.set_title("Time (10 µs)", color="gray", fontsize=6)
-ax_td.tick_params(colors="gray", labelsize=5)
-ax_td.set_facecolor("#0a0a0a")
-ax_td.grid(True, color="#222", linewidth=0.4)
-ax_td.set_xlabel("µs", color="gray", fontsize=5)
+    return fig, ax_spec, ax_td, spec_line, td_line
 
-plt.savefig("am_spectrum.png", dpi=150, bbox_inches="tight",
-            facecolor=fig.get_facecolor())
-plt.show()
-print("Plot saved -> am_spectrum.png")
+
+# ─── Animation ────────────────────────────────────────────────────────────────
+def make_init(spec_line, td_line):
+    def init():
+        spec_line.set_data([], [])
+        td_line.set_ydata(np.zeros(TD_SAMPLES))
+        return spec_line, td_line
+    return init
+
+
+def make_update(spec_line, td_line, state):
+    def update(_frame):
+        chunk = generate_chunk(state["t_offset"])
+        state["t_offset"] += CHUNK / FS
+
+        # Roll ring buffer
+        ring = state["ring"]
+        ring[:-CHUNK] = ring[CHUNK:]
+        ring[-CHUNK:]  = chunk
+
+        # Roll time-domain buffer
+        td = state["td_buffer"]
+        td[:-CHUNK] = td[CHUNK:]
+        td[-CHUNK:]  = chunk
+
+        spec_line.set_data(FREQS_KHZ, compute_spectrum(ring))
+        td_line.set_ydata(td)
+        return spec_line, td_line
+    return update
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    fig, ax_spec, ax_td, spec_line, td_line = build_figure()
+
+    state = {
+        "ring":      np.zeros(N_FFT),
+        "t_offset":  0.0,
+        "td_buffer": np.zeros(TD_SAMPLES),
+    }
+
+    anim = FuncAnimation(
+        fig,
+        make_update(spec_line, td_line, state),
+        init_func=make_init(spec_line, td_line),
+        interval=INTERVAL,
+        blit=True,
+        cache_frame_data=False,
+    )
+
+    plt.show()
