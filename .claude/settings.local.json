@@ -9,7 +9,8 @@
       "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/pip.exe list *)",
       "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/python.exe *)",
       "Bash(.venv/Scripts/python.exe -c ' *)",
-      "Bash(.venv/Scripts/python.exe audio/generate.py)"
+      "Bash(.venv/Scripts/python.exe audio/generate.py)",
+      "Bash(.venv/Scripts/python.exe *)"
     ]
   }
 }
