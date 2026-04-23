@@ -6,7 +6,7 @@ Signal model knowledge comes entirely through SignalBase / SIGNAL_REGISTRY.
 
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import ttk, messagebox
 
 from config import NOISE_STD, UDP_HOST, UDP_PORT
 from signals import SignalBase, SIGNAL_REGISTRY
@@ -23,7 +23,13 @@ ENTRY_BG = "#3c3c3c"
 SEL_BG   = "#094771"
 
 # Listbox colour per mod_type key
-_TYPE_COLOR = {"AM": FG, "FM": "#FFD700", "ASK": "#00FF9F"}
+_TYPE_COLOR = {
+    "AM":     FG,
+    "FM":     "#FFD700",
+    "ASK":    "#00FF9F",
+    "WAV-AM": "#FF99DD",
+    "WAV-FM": "#FFBB66",
+}
 
 
 class App(tk.Tk):
@@ -182,10 +188,27 @@ class App(tk.Tk):
         for i, spec in enumerate(cls.type_field_specs()):
             tk.Label(self._type_frame, text=spec.label, bg=BG2, fg=FG,
                      font=("Consolas", 9)).grid(row=i, column=0, sticky="w", pady=3)
-            e = tk.Entry(self._type_frame, bg=ENTRY_BG, fg=FG, insertbackground=FG,
-                         font=("Consolas", 9), width=14, relief="flat", bd=4)
+
             val = prefill.get(spec.key, spec.default) if prefill else spec.default
-            e.insert(0, val)
+
+            if spec.choices is not None:
+                # Style the combobox to match the dark theme
+                style = ttk.Style()
+                style.theme_use("default")
+                style.configure("Dark.TCombobox",
+                                fieldbackground=ENTRY_BG, background=BG3,
+                                foreground=FG, selectbackground=SEL_BG,
+                                selectforeground="white", arrowcolor=FG)
+                e = ttk.Combobox(self._type_frame, values=spec.choices,
+                                 font=("Consolas", 9), width=20,
+                                 state="readonly", style="Dark.TCombobox")
+                e.set(val if val in spec.choices else (spec.choices[0] if spec.choices else ""))
+            else:
+                e = tk.Entry(self._type_frame, bg=ENTRY_BG, fg=FG,
+                             insertbackground=FG, font=("Consolas", 9),
+                             width=22, relief="flat", bd=4)
+                e.insert(0, val)
+
             e.grid(row=i, column=1, sticky="w", padx=(8, 0), pady=3)
             self._type_entries[spec.key] = e
 
