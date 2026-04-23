@@ -24,11 +24,9 @@ SEL_BG   = "#094771"
 
 # Listbox colour per mod_type key
 _TYPE_COLOR = {
-    "AM":     FG,
-    "FM":     "#FFD700",
-    "ASK":    "#00FF9F",
-    "WAV-AM": "#FF99DD",
-    "WAV-FM": "#FFBB66",
+    "AM":  FG,
+    "FM":  "#FFD700",
+    "ASK": "#00FF9F",
 }
 
 

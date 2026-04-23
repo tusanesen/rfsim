@@ -1,10 +1,12 @@
 """
-Signal model — base class + AM, FM, ASK, WAV-AM, WAV-FM concrete types.
+Signal model — base class + AM, FM, ASK concrete types.
+AM and FM each carry an optional WAV modulator; when unset they fall back
+to a sine wave so the behaviour is identical to before.
 GUI interacts with all signals through SignalBase only.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import ClassVar
 import os
 import wave
@@ -13,11 +15,11 @@ import numpy as np
 from config import FS
 
 AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
+_WAV_DEFAULT = "(default)"   # sentinel meaning "use sine modulator"
 
 TWO_PI = 2 * np.pi
 
-# Deterministic pseudo-random bit sequence used by ASK (seed fixed so every
-# run produces the same pattern; long enough to avoid visible repetition)
+# Deterministic PRBS for ASK
 _PRBS = np.random.RandomState(0xA5).randint(0, 2, 65536)
 
 
@@ -28,12 +30,16 @@ def _list_wav_files() -> list:
     return sorted(f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(".wav"))
 
 
+def _wav_choices() -> list:
+    return [_WAV_DEFAULT] + _list_wav_files()
+
+
 def _load_wav(filename: str) -> tuple:
-    """Load a WAV from AUDIO_DIR. Returns (samples: float32 ndarray, sample_rate: int)."""
+    """Returns (samples: float32 ndarray normalised to ±1, sample_rate: int)."""
     path = os.path.join(AUDIO_DIR, filename)
     with wave.open(path, "r") as wf:
-        nch  = wf.getnchannels()
-        sw   = wf.getsampwidth()
+        nch = wf.getnchannels()
+        sw  = wf.getsampwidth()
         rate = wf.getframerate()
         raw  = wf.readframes(wf.getnframes())
 
@@ -71,9 +77,8 @@ class SignalBase(ABC):
         self.amplitude = amplitude
         self.enabled   = enabled
 
-    # ── Form metadata (class-level) ───────────────────────────────────────────
     @classmethod
-    def common_field_specs(cls) -> list[FieldSpec]:
+    def common_field_specs(cls) -> list:
         return [
             FieldSpec("label", "Label",         "SIG"),
             FieldSpec("fc",    "Carrier (kHz)", "100"),
@@ -82,26 +87,20 @@ class SignalBase(ABC):
 
     @classmethod
     @abstractmethod
-    def type_field_specs(cls) -> list[FieldSpec]:
-        """Return field specs for this modulation's parameters (no common fields)."""
+    def type_field_specs(cls) -> list:
         ...
 
-    # ── Serialisation to/from GUI form dict ───────────────────────────────────
     @classmethod
     @abstractmethod
-    def from_form(cls, values: dict[str, str]) -> "SignalBase":
-        """Construct an instance from a flat string-value dict (no validation)."""
+    def from_form(cls, values: dict) -> "SignalBase":
         ...
 
     @abstractmethod
-    def to_form(self) -> dict[str, str]:
-        """Return a dict that can pre-fill the GUI form for this signal."""
+    def to_form(self) -> dict:
         ...
 
-    # ── Validation ────────────────────────────────────────────────────────────
     @classmethod
-    def validate(cls, values: dict[str, str]) -> list[str]:
-        """Return a list of human-readable error strings (empty = valid)."""
+    def validate(cls, values: dict) -> list:
         errors = []
         nyq = FS / 2
         try:
@@ -118,16 +117,12 @@ class SignalBase(ABC):
             errors.append("Amplitude must be a number.")
         return errors
 
-    # ── Signal generation ─────────────────────────────────────────────────────
     @abstractmethod
     def generate(self, t: np.ndarray) -> np.ndarray:
-        """Return samples for the given time vector (phase-continuous)."""
         ...
 
-    # ── List display ──────────────────────────────────────────────────────────
     @abstractmethod
     def describe(self) -> str:
-        """One-line string for the GUI listbox."""
         ...
 
     def _tag(self) -> str:
@@ -135,7 +130,7 @@ class SignalBase(ABC):
 
 
 # ── Registry ──────────────────────────────────────────────────────────────────
-SIGNAL_REGISTRY: dict[str, type[SignalBase]] = {}
+SIGNAL_REGISTRY: dict = {}
 
 def _register(cls: type) -> type:
     SIGNAL_REGISTRY[cls.mod_type] = cls
@@ -147,16 +142,29 @@ def _register(cls: type) -> type:
 class AMSignal(SignalBase):
     mod_type = "AM"
 
-    def __init__(self, label, fc, fm, mod_index, amplitude=1.0, enabled=True):
+    def __init__(self, label, fc, fm, mod_index, amplitude=1.0,
+                 wav_file=_WAV_DEFAULT, enabled=True):
         super().__init__(label, fc, amplitude, enabled)
         self.fm        = fm
         self.mod_index = mod_index
+        self._load_wav(wav_file)
+
+    def _load_wav(self, wav_file: str):
+        self.wav_file  = wav_file
+        self._samples  = None
+        self._audio_fs = 8_000
+        if wav_file and wav_file != _WAV_DEFAULT:
+            try:
+                self._samples, self._audio_fs = _load_wav(wav_file)
+            except Exception:
+                self._samples = None
 
     @classmethod
-    def type_field_specs(cls) -> list[FieldSpec]:
+    def type_field_specs(cls) -> list:
         return [
-            FieldSpec("fm",        "Mod Freq (kHz)", "2"),
+            FieldSpec("fm",        "Mod Freq (kHz)",  "2"),
             FieldSpec("mod_index", "Mod Index (0-1)", "0.5"),
+            FieldSpec("wav_file",  "Modulator",       _WAV_DEFAULT, choices=_wav_choices()),
         ]
 
     @classmethod
@@ -167,10 +175,11 @@ class AMSignal(SignalBase):
             fm        = float(v["fm"])        * 1000,
             mod_index = float(v["mod_index"]),
             amplitude = float(v["amp"]),
+            wav_file  = v.get("wav_file", _WAV_DEFAULT),
         )
 
     @classmethod
-    def validate(cls, v: dict) -> list[str]:
+    def validate(cls, v: dict) -> list:
         errors = super().validate(v)
         try:
             fm = float(v["fm"]) * 1000
@@ -188,20 +197,27 @@ class AMSignal(SignalBase):
 
     def to_form(self) -> dict:
         return {
-            "label": self.label,        "fc":  f"{self.fc/1000:.3f}",
-            "amp":   f"{self.amplitude:.2f}",
-            "fm":    f"{self.fm/1000:.4f}", "mod_index": f"{self.mod_index:.3f}",
+            "label":     self.label,
+            "fc":        f"{self.fc/1000:.3f}",
+            "amp":       f"{self.amplitude:.2f}",
+            "fm":        f"{self.fm/1000:.4f}",
+            "mod_index": f"{self.mod_index:.3f}",
+            "wav_file":  self.wav_file,
         }
 
     def generate(self, t: np.ndarray) -> np.ndarray:
-        return (self.amplitude
-                * (1.0 + self.mod_index * np.cos(TWO_PI * self.fm * t))
-                * np.cos(TWO_PI * self.fc * t))
+        if self._samples is not None:
+            idx = (t * self._audio_fs).astype(np.int64) % len(self._samples)
+            m   = self._samples[idx]
+        else:
+            m = np.cos(TWO_PI * self.fm * t)
+        return self.amplitude * (1.0 + self.mod_index * m) * np.cos(TWO_PI * self.fc * t)
 
     def describe(self) -> str:
+        wav = f"  [{self.wav_file}]" if self._samples is not None else ""
         return (f"{self._tag()} [AM]  {self.label:<6}  "
                 f"fc={self.fc/1000:.1f}kHz  fm={self.fm/1000:.2f}kHz  "
-                f"m={self.mod_index:.2f}  A={self.amplitude:.2f}")
+                f"m={self.mod_index:.2f}  A={self.amplitude:.2f}{wav}")
 
 
 # ── FM ────────────────────────────────────────────────────────────────────────
@@ -209,16 +225,34 @@ class AMSignal(SignalBase):
 class FMSignal(SignalBase):
     mod_type = "FM"
 
-    def __init__(self, label, fc, fm, deviation, amplitude=1.0, enabled=True):
+    def __init__(self, label, fc, fm, deviation, amplitude=1.0,
+                 wav_file=_WAV_DEFAULT, enabled=True):
         super().__init__(label, fc, amplitude, enabled)
         self.fm        = fm
-        self.deviation = deviation   # Hz
+        self.deviation = deviation
+        self._load_wav(wav_file)
+
+    def _load_wav(self, wav_file: str):
+        self.wav_file       = wav_file
+        self._samples       = None
+        self._audio_fs      = 8_000
+        self._cumsum        = None
+        self._loop_integral = 0.0
+        if wav_file and wav_file != _WAV_DEFAULT:
+            try:
+                self._samples, self._audio_fs = _load_wav(wav_file)
+                # Pre-compute phase integral for stateless FM generation across chunks
+                self._cumsum        = np.cumsum(self._samples).astype(np.float64) / self._audio_fs
+                self._loop_integral = float(self._cumsum[-1])
+            except Exception:
+                self._samples = None
 
     @classmethod
-    def type_field_specs(cls) -> list[FieldSpec]:
+    def type_field_specs(cls) -> list:
         return [
             FieldSpec("fm",        "Mod Freq (kHz)", "5"),
             FieldSpec("deviation", "Deviation (Hz)", "5000"),
+            FieldSpec("wav_file",  "Modulator",      _WAV_DEFAULT, choices=_wav_choices()),
         ]
 
     @classmethod
@@ -229,10 +263,11 @@ class FMSignal(SignalBase):
             fm        = float(v["fm"])        * 1000,
             deviation = float(v["deviation"]),
             amplitude = float(v["amp"]),
+            wav_file  = v.get("wav_file", _WAV_DEFAULT),
         )
 
     @classmethod
-    def validate(cls, v: dict) -> list[str]:
+    def validate(cls, v: dict) -> list:
         errors = super().validate(v)
         try:
             fm = float(v["fm"]) * 1000
@@ -250,41 +285,52 @@ class FMSignal(SignalBase):
 
     def to_form(self) -> dict:
         return {
-            "label": self.label,        "fc":  f"{self.fc/1000:.3f}",
-            "amp":   f"{self.amplitude:.2f}",
-            "fm":    f"{self.fm/1000:.4f}", "deviation": f"{self.deviation:.1f}",
+            "label":     self.label,
+            "fc":        f"{self.fc/1000:.3f}",
+            "amp":       f"{self.amplitude:.2f}",
+            "fm":        f"{self.fm/1000:.4f}",
+            "deviation": f"{self.deviation:.1f}",
+            "wav_file":  self.wav_file,
         }
 
     def generate(self, t: np.ndarray) -> np.ndarray:
-        beta = self.deviation / self.fm
-        return self.amplitude * np.cos(TWO_PI * self.fc * t
-                                       + beta * np.sin(TWO_PI * self.fm * t))
+        if self._samples is not None and self._cumsum is not None:
+            n          = len(self._samples)
+            idx        = (t * self._audio_fs).astype(np.int64)
+            full_loops = idx // n
+            within_idx = idx % n
+            phase_int  = self._cumsum[within_idx] + full_loops * self._loop_integral
+            return self.amplitude * np.cos(TWO_PI * self.fc * t
+                                            + TWO_PI * self.deviation * phase_int)
+        else:
+            beta = self.deviation / self.fm
+            return self.amplitude * np.cos(TWO_PI * self.fc * t
+                                           + beta * np.sin(TWO_PI * self.fm * t))
 
     def describe(self) -> str:
+        wav = f"  [{self.wav_file}]" if self._samples is not None else ""
         return (f"{self._tag()} [FM]  {self.label:<6}  "
                 f"fc={self.fc/1000:.1f}kHz  fm={self.fm/1000:.2f}kHz  "
-                f"dev={self.deviation/1000:.1f}kHz  A={self.amplitude:.2f}")
+                f"dev={self.deviation/1000:.1f}kHz  A={self.amplitude:.2f}{wav}")
 
 
 # ── ASK ───────────────────────────────────────────────────────────────────────
 @_register
 class ASKSignal(SignalBase):
     """
-    2-ASK / OOK.  Amplitude toggles between `amplitude` (bit=1) and
-    `amplitude * low_level` (bit=0) at the given bitrate.
-    low_level=0 → OOK (on-off keying).
-    Bit pattern is deterministic (seeded PRBS) so phase is reproducible
-    from t_offset alone — no state needed across chunk boundaries.
+    2-ASK / OOK. Amplitude toggles between amplitude (bit=1) and
+    amplitude*low_level (bit=0). low_level=0 → OOK.
+    Bit pattern is deterministic from t alone — no state across chunks.
     """
     mod_type = "ASK"
 
     def __init__(self, label, fc, bitrate, low_level=0.0, amplitude=1.0, enabled=True):
         super().__init__(label, fc, amplitude, enabled)
-        self.bitrate   = bitrate     # bps
-        self.low_level = low_level   # amplitude ratio for '0' bit
+        self.bitrate   = bitrate
+        self.low_level = low_level
 
     @classmethod
-    def type_field_specs(cls) -> list[FieldSpec]:
+    def type_field_specs(cls) -> list:
         return [
             FieldSpec("bitrate",   "Bit Rate (bps)", "2000"),
             FieldSpec("low_level", "Low Level (0-1)", "0.0"),
@@ -301,7 +347,7 @@ class ASKSignal(SignalBase):
         )
 
     @classmethod
-    def validate(cls, v: dict) -> list[str]:
+    def validate(cls, v: dict) -> list:
         errors = super().validate(v)
         try:
             br = float(v["bitrate"])
@@ -319,8 +365,9 @@ class ASKSignal(SignalBase):
 
     def to_form(self) -> dict:
         return {
-            "label": self.label,        "fc":  f"{self.fc/1000:.3f}",
-            "amp":   f"{self.amplitude:.2f}",
+            "label":     self.label,
+            "fc":        f"{self.fc/1000:.3f}",
+            "amp":       f"{self.amplitude:.2f}",
             "bitrate":   f"{self.bitrate:.0f}",
             "low_level": f"{self.low_level:.2f}",
         }
@@ -338,171 +385,16 @@ class ASKSignal(SignalBase):
                 f"lo={self.low_level:.2f} ({mode})  A={self.amplitude:.2f}")
 
 
-# ── WAV-AM ────────────────────────────────────────────────────────────────────
-@_register
-class WavAMSignal(SignalBase):
-    """AM signal using a WAV file as the modulating waveform instead of a sine."""
-    mod_type = "WAV-AM"
-
-    def __init__(self, label, fc, wav_file, depth, amplitude=1.0, enabled=True):
-        super().__init__(label, fc, amplitude, enabled)
-        self.depth = depth
-        self._set_wav(wav_file)
-
-    def _set_wav(self, wav_file: str):
-        self.wav_file = wav_file
-        path = os.path.join(AUDIO_DIR, wav_file) if wav_file else ""
-        if wav_file and os.path.isfile(path):
-            self._samples, self._audio_fs = _load_wav(wav_file)
-        else:
-            # fallback: 1 kHz sine at 8 kHz
-            self._audio_fs = 8_000
-            t = np.arange(self._audio_fs) / self._audio_fs
-            self._samples = np.sin(TWO_PI * 1000 * t).astype(np.float32)
-
-    @classmethod
-    def type_field_specs(cls) -> list:
-        wavs = _list_wav_files()
-        return [
-            FieldSpec("wav_file", "Audio File",    wavs[0] if wavs else "", choices=wavs),
-            FieldSpec("depth",    "Mod Depth (0-1)", "0.7"),
-        ]
-
-    @classmethod
-    def from_form(cls, v: dict) -> "WavAMSignal":
-        return cls(
-            label     = v["label"].strip() or "SIG",
-            fc        = float(v["fc"]) * 1000,
-            wav_file  = v.get("wav_file", ""),
-            depth     = float(v["depth"]),
-            amplitude = float(v["amp"]),
-        )
-
-    @classmethod
-    def validate(cls, v: dict) -> list:
-        errors = super().validate(v)
-        if not v.get("wav_file"):
-            errors.append("Select an audio file.")
-        try:
-            d = float(v["depth"])
-            if not (0 < d <= 1.0):
-                errors.append("Mod depth must be in (0, 1].")
-        except (ValueError, KeyError):
-            errors.append("Mod depth must be a number.")
-        return errors
-
-    def to_form(self) -> dict:
-        return {
-            "label": self.label, "fc": f"{self.fc/1000:.3f}",
-            "amp": f"{self.amplitude:.2f}",
-            "wav_file": self.wav_file, "depth": f"{self.depth:.2f}",
-        }
-
-    def generate(self, t: np.ndarray) -> np.ndarray:
-        idx = (t * self._audio_fs).astype(np.int64) % len(self._samples)
-        m   = self._samples[idx]
-        return self.amplitude * (1.0 + self.depth * m) * np.cos(TWO_PI * self.fc * t)
-
-    def describe(self) -> str:
-        return (f"{self._tag()} [WAV-AM] {self.label:<6}  "
-                f"fc={self.fc/1000:.1f}kHz  [{self.wav_file}]  "
-                f"depth={self.depth:.2f}  A={self.amplitude:.2f}")
-
-
-# ── WAV-FM ────────────────────────────────────────────────────────────────────
-@_register
-class WavFMSignal(SignalBase):
-    """
-    FM signal using a WAV file as the modulating waveform.
-    Phase integral is pre-computed as a cumulative sum so generate() is
-    stateless: any t vector produces the correct continuous phase.
-    Loop discontinuity is handled by accumulating whole-loop integrals.
-    """
-    mod_type = "WAV-FM"
-
-    def __init__(self, label, fc, wav_file, deviation, amplitude=1.0, enabled=True):
-        super().__init__(label, fc, amplitude, enabled)
-        self.deviation = deviation
-        self._set_wav(wav_file)
-
-    def _set_wav(self, wav_file: str):
-        self.wav_file = wav_file
-        path = os.path.join(AUDIO_DIR, wav_file) if wav_file else ""
-        if wav_file and os.path.isfile(path):
-            self._samples, self._audio_fs = _load_wav(wav_file)
-        else:
-            self._audio_fs = 8_000
-            t = np.arange(self._audio_fs) / self._audio_fs
-            self._samples = np.sin(TWO_PI * 1000 * t).astype(np.float32)
-        # Pre-compute cumulative integral of the modulator (used for FM phase)
-        self._cumsum        = np.cumsum(self._samples).astype(np.float64) / self._audio_fs
-        self._loop_integral = float(self._cumsum[-1])
-
-    @classmethod
-    def type_field_specs(cls) -> list:
-        wavs = _list_wav_files()
-        return [
-            FieldSpec("wav_file",  "Audio File",     wavs[0] if wavs else "", choices=wavs),
-            FieldSpec("deviation", "Deviation (Hz)", "5000"),
-        ]
-
-    @classmethod
-    def from_form(cls, v: dict) -> "WavFMSignal":
-        return cls(
-            label     = v["label"].strip() or "SIG",
-            fc        = float(v["fc"]) * 1000,
-            wav_file  = v.get("wav_file", ""),
-            deviation = float(v["deviation"]),
-            amplitude = float(v["amp"]),
-        )
-
-    @classmethod
-    def validate(cls, v: dict) -> list:
-        errors = super().validate(v)
-        if not v.get("wav_file"):
-            errors.append("Select an audio file.")
-        try:
-            d = float(v["deviation"])
-            if d <= 0:
-                errors.append("Deviation must be > 0 Hz.")
-        except (ValueError, KeyError):
-            errors.append("Deviation must be a number.")
-        return errors
-
-    def to_form(self) -> dict:
-        return {
-            "label": self.label, "fc": f"{self.fc/1000:.3f}",
-            "amp": f"{self.amplitude:.2f}",
-            "wav_file": self.wav_file, "deviation": f"{self.deviation:.1f}",
-        }
-
-    def generate(self, t: np.ndarray) -> np.ndarray:
-        n          = len(self._samples)
-        idx        = (t * self._audio_fs).astype(np.int64)
-        full_loops = idx // n
-        within_idx = idx % n
-        # ∫₀ᵗ m(τ)dτ = integral of k full loops + integral within current loop
-        phase_int  = self._cumsum[within_idx] + full_loops * self._loop_integral
-        return self.amplitude * np.cos(TWO_PI * self.fc * t
-                                        + TWO_PI * self.deviation * phase_int)
-
-    def describe(self) -> str:
-        return (f"{self._tag()} [WAV-FM] {self.label:<6}  "
-                f"fc={self.fc/1000:.1f}kHz  [{self.wav_file}]  "
-                f"dev={self.deviation/1000:.1f}kHz  A={self.amplitude:.2f}")
-
-
 # ── Defaults ──────────────────────────────────────────────────────────────────
-def default_signals() -> list[SignalBase]:
+def default_signals() -> list:
     wavs = _list_wav_files()
-    defaults = [
+    return [
         AMSignal( "CH1",  60_000,  1_000, 0.50),
         AMSignal( "CH2",  90_000,  2_500, 0.70),
         AMSignal( "CH3", 130_000,  5_000, 0.40),
         FMSignal( "CH4", 170_000, 10_000, 8_000),
         ASKSignal("CH5", 210_000,  2_000, 0.0),
+        AMSignal( "CH6",  80_000,  1_000, 0.85, wav_file=wavs[0] if wavs else _WAV_DEFAULT),
+        FMSignal( "CH7", 150_000,  5_000, 6_000,
+                  wav_file=wavs[1] if len(wavs) > 1 else _WAV_DEFAULT),
     ]
-    if wavs:
-        defaults.append(WavAMSignal("CH6", 80_000,  wavs[0], 0.85))
-        defaults.append(WavFMSignal("CH7", 150_000, wavs[1] if len(wavs) > 1 else wavs[0], 6_000))
-    return defaults
