@@ -7,6 +7,8 @@ Receives UDP chunks from signal_gen.py. Provides:
 """
 
 import collections
+import datetime
+import os
 import socket
 import threading
 import queue
@@ -21,6 +23,29 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sounddevice as sd
 
 from config import FS, N_FFT, CHUNK, F_LO, F_HI, UDP_HOST, UDP_PORT
+
+RECORDINGS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+_MAX_REC_BYTES  = 10 * 1024 ** 3   # 10 GB
+
+
+def _ensure_recordings_dir():
+    """Create recordings folder and evict oldest files if total size > 10 GB."""
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    entries = []
+    for name in os.listdir(RECORDINGS_DIR):
+        path = os.path.join(RECORDINGS_DIR, name)
+        if os.path.isfile(path):
+            entries.append((os.path.getmtime(path), os.path.getsize(path), path))
+    entries.sort()                          # oldest first
+    total = sum(sz for _, sz, _ in entries)
+    while total > _MAX_REC_BYTES and entries:
+        mtime, sz, path = entries.pop(0)
+        try:
+            os.remove(path)
+            total -= sz
+            print(f"Evicted old recording: {os.path.basename(path)}")
+        except OSError as e:
+            print(f"Could not remove {path}: {e}")
 
 plt.style.use("dark_background")
 
@@ -40,8 +65,9 @@ OV_FREQS   = _freqs_ov[_ov_mask] / 1000.0
 _WIN_WB = np.blackman(N_FFT_WB)
 _WIN_NB = np.blackman(N_FFT_NB)
 
-DDR_BW_CHOICES  = ["5", "10", "25", "50"]   # kHz
+DDR_BW_CHOICES  = ["5", "10", "25", "50"]      # kHz
 DDR_MOD_CHOICES = ["--", "AM", "FM", "ASK"]
+FFT_SIZE_CHOICES = ["64", "128", "256", "512", "1024"]
 
 # DDR slot colours
 DDR_COLORS = ["#FFA500", "#DA70D6"]   # orange, orchid
@@ -88,7 +114,7 @@ def _spectrum(ring: np.ndarray, window: np.ndarray, n_fft: int) -> np.ndarray:
     return 20 * np.log10(np.abs(X) / n_fft + 1e-12)
 
 
-# ── DDC + Demodulation ────────────────────────────────────────────────────────
+# ── DDC + Demodulation (batch, used for display/analysis) ─────────────────────
 def ddc(ring: np.ndarray, fc_hz: float, bw_hz: float):
     """Digital down-convert ring to complex baseband. Returns (bb_complex64, fs_out)."""
     n     = len(ring)
@@ -102,59 +128,119 @@ def ddc(ring: np.ndarray, fc_hz: float, bw_hz: float):
     return bb[::dec].astype(np.complex64), float(FS / dec)
 
 
-def demodulate(bb: np.ndarray, fs_bb: float, mod: str) -> np.ndarray:
-    """Demodulate complex baseband to float32 audio."""
-    if mod == "AM":
-        out = np.abs(bb).astype(np.float32)
-        out -= out.mean()
-    elif mod == "FM":
-        phase = np.unwrap(np.angle(bb))
-        out   = np.diff(phase, prepend=phase[0]).astype(np.float32)
-        peak  = np.abs(out).max() + 1e-9
-        out  /= peak
-    elif mod == "ASK":
-        env = np.abs(bb)
-        out = ((env > env.mean()) * 2 - 1).astype(np.float32)
-    else:
-        out = np.zeros(len(bb), dtype=np.float32)
-    return out
-
-
-# ── DDReceiver (model + audio stream) ─────────────────────────────────────────
+# ── DDReceiver (streaming model + audio stream) ────────────────────────────────
 class DDReceiver:
+    """
+    Streaming DDC pipeline: every incoming UDP chunk is processed immediately
+    so the audio buffer fills at exactly the stream drain rate.
+
+    Phase continuity: _t_abs tracks the absolute sample index so the LO
+    complex exponential is continuous across chunk boundaries.
+
+    Decimation: integrate-and-dump (reshape + mean) with a leftover buffer
+    so no samples are lost or double-counted across chunks.
+
+    FM continuity: _prev_fm_angle carries the last unwrapped phase forward
+    so there are no click artefacts at chunk boundaries.
+    """
+
     def __init__(self):
         self.fc_hz    = None
         self.bw_hz    = 10_000.0
         self.mod_type = None
         self._playing = False
-        self._fs_out  = 10_000.0
+        self._dec     = 50                              # FS / bw_hz
+        self._fs_out  = 10_000.0                       # bw_hz
+        self._t_abs   = 0                              # absolute sample counter
+        self._leftover = np.empty(0, dtype=np.complex128)  # fractional-dec remainder
+        self._prev_fm_angle = 0.0                      # FM phase continuity
         self._buf     = collections.deque(maxlen=200_000)
         self._stream  = None
+        self._rec_file: "IO | None" = None
+        self._recording = False
 
     @property
     def playing(self):
         return self._playing
 
-    def process(self, ring_wb: np.ndarray):
+    @property
+    def recording(self):
+        return self._recording
+
+    def configure(self, fc_hz: float, bw_hz: float):
+        """Call whenever fc or BW changes. Resets streaming state; stops any recording."""
+        was_playing = self._playing
+        if was_playing:
+            self.stop_playback()
+        if self._recording:
+            self.stop_recording()
+        self.fc_hz   = fc_hz
+        self.bw_hz   = bw_hz
+        self._dec    = max(1, int(FS / bw_hz))
+        self._fs_out = float(FS / self._dec)
+        self._leftover      = np.empty(0, dtype=np.complex128)
+        self._prev_fm_angle = 0.0
+        if was_playing:
+            self.start_playback()
+
+    def push_chunk(self, chunk: np.ndarray):
+        """Process one incoming UDP chunk through the streaming DDC pipeline."""
+        self._t_abs += CHUNK
         if self.fc_hz is None:
             return
-        bb, fs_out = ddc(ring_wb, self.fc_hz, self.bw_hz)
+
+        # Phase-continuous complex mix to baseband
+        t  = (np.arange(CHUNK, dtype=np.float64) + (self._t_abs - CHUNK)) / FS
+        lo = np.exp(-1j * 2 * np.pi * self.fc_hz * t)
+        bb = chunk.astype(np.float64) * lo
+
+        # Integrate-and-dump decimation with leftover tracking
+        dec  = self._dec
+        work = np.concatenate([self._leftover, bb])
+        n_full = len(work) // dec
+        self._leftover = work[n_full * dec:]
+        if n_full == 0:
+            return
+        bb_dec = work[:n_full * dec].reshape(n_full, dec).mean(axis=1).astype(np.complex64)
+
+        # Write raw IQ to file
+        if self._recording and self._rec_file:
+            self._rec_file.write(bb_dec.tobytes())
+
+        # Feed audio if playing
         if self.mod_type and self._playing:
-            audio = demodulate(bb, fs_out, self.mod_type)
+            audio = self._demodulate(bb_dec)
             self._buf.extend(audio.tolist())
+
+    def _demodulate(self, bb: np.ndarray) -> np.ndarray:
+        if self.mod_type == "AM":
+            out = np.abs(bb).astype(np.float32)
+            out -= out.mean()                        # remove carrier DC per chunk
+        elif self.mod_type == "FM":
+            angles  = np.angle(bb).astype(np.float64)
+            all_a   = np.concatenate([[self._prev_fm_angle], angles])
+            self._prev_fm_angle = float(angles[-1])
+            out     = np.diff(np.unwrap(all_a)).astype(np.float32)
+            peak    = np.abs(out).max() + 1e-9
+            out    /= peak
+        elif self.mod_type == "ASK":
+            env = np.abs(bb)
+            out = ((env > env.mean()) * 2 - 1).astype(np.float32)
+        else:
+            out = np.zeros(len(bb), dtype=np.float32)
+        return out
 
     def start_playback(self):
         self.stop_playback()
         if self.fc_hz is None:
             return
-        _, self._fs_out = ddc(np.zeros(N_FFT_WB), self.fc_hz, self.bw_hz)
         try:
             self._stream = sd.OutputStream(
                 samplerate=self._fs_out,
                 channels=1,
                 callback=self._sd_callback,
                 dtype="float32",
-                blocksize=512,
+                blocksize=256,
             )
             self._stream.start()
             self._playing = True
@@ -171,6 +257,28 @@ class DDReceiver:
             self._stream = None
         self._playing = False
         self._buf.clear()
+        self._leftover      = np.empty(0, dtype=np.complex128)
+        self._prev_fm_angle = 0.0
+
+    def start_recording(self):
+        """Open a new binary IQ file. Filename encodes fc, sample-rate, and timestamp."""
+        self.stop_recording()
+        if self.fc_hz is None:
+            return
+        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fc_k = int(self.fc_hz / 1000)
+        sr_k = int(self._fs_out / 1000)
+        name = f"IQ_{fc_k}kHz_SR{sr_k}kHz_{ts}.bin"
+        path = os.path.join(RECORDINGS_DIR, name)
+        self._rec_file  = open(path, "wb")
+        self._recording = True
+        print(f"Recording IQ -> {name}")
+
+    def stop_recording(self):
+        if self._rec_file:
+            self._rec_file.close()
+            self._rec_file  = None
+        self._recording = False
 
     def _sd_callback(self, outdata, frames, _time, _status):
         n = min(frames, len(self._buf))
@@ -181,61 +289,70 @@ class DDReceiver:
 
 # ── DDRPanel ───────────────────────────────────────────────────────────────────
 class DDRPanel(tk.LabelFrame):
-    def __init__(self, parent, idx: int, ddr: DDReceiver, canvas_ref, **kw):
-        color = DDR_COLORS[idx]
-        super().__init__(parent, text=f" DDR-{idx+1} ", bg=BG2, fg=color,
+    def __init__(self, parent, idx: int, ddr: DDReceiver, canvas_ref,
+                 linked: bool = False, **kw):
+        color = DDR_COLORS[min(idx, len(DDR_COLORS) - 1)]
+        label = " DDR " if linked else f" DDR-{idx+1} "
+        super().__init__(parent, text=label, bg=BG2, fg=color,
                          font=("Consolas", 9, "bold"),
                          relief="flat", bd=1, highlightthickness=1,
                          highlightbackground=color, **kw)
         self._ddr        = ddr
         self._idx        = idx
         self._color      = color
-        self._canvas_ref = canvas_ref   # ChannelCanvas instance; set after construction
+        self._canvas_ref = canvas_ref
+        self._linked     = linked     # True = NB mode; fc/bw come from channel
         self._build()
 
     def _build(self):
         pad = {"padx": 4, "pady": 3}
 
-        # Freq row
-        freq_row = tk.Frame(self, bg=BG2)
-        freq_row.pack(fill="x", **pad)
-        tk.Label(freq_row, text="Freq (kHz)", bg=BG2, fg=FG,
-                 font=("Consolas", 8)).pack(side="left")
-        self._fc_var = tk.StringVar()
-        self._fc_entry = tk.Entry(freq_row, textvariable=self._fc_var,
-                                  bg=ENTRY_BG, fg=FG, insertbackground=FG,
-                                  font=("Consolas", 9), width=8,
-                                  relief="flat", bd=3)
-        self._fc_entry.pack(side="left", padx=(4, 4))
-        self._fc_entry.bind("<Return>", lambda _: self._apply())
+        if not self._linked:
+            # Freq row
+            freq_row = tk.Frame(self, bg=BG2)
+            freq_row.pack(fill="x", **pad)
+            tk.Label(freq_row, text="Freq (kHz)", bg=BG2, fg=FG,
+                     font=("Consolas", 8)).pack(side="left")
+            self._fc_var = tk.StringVar()
+            self._fc_entry = tk.Entry(freq_row, textvariable=self._fc_var,
+                                      bg=ENTRY_BG, fg=FG, insertbackground=FG,
+                                      font=("Consolas", 9), width=8,
+                                      relief="flat", bd=3)
+            self._fc_entry.pack(side="left", padx=(4, 4))
+            self._fc_entry.bind("<Return>", lambda _: self._apply())
 
-        self._tune_btn = tk.Button(freq_row, text="Tune", font=("Consolas", 8),
-                                   bg=BG3, fg=self._color,
-                                   activebackground=self._color, activeforeground=BG,
-                                   relief="flat", bd=0, padx=5, pady=1,
-                                   cursor="hand2",
-                                   command=self._start_tune)
-        self._tune_btn.pack(side="left")
+            self._tune_btn = tk.Button(freq_row, text="Tune", font=("Consolas", 8),
+                                       bg=BG3, fg=self._color,
+                                       activebackground=self._color, activeforeground=BG,
+                                       relief="flat", bd=0, padx=5, pady=1,
+                                       cursor="hand2",
+                                       command=self._start_tune)
+            self._tune_btn.pack(side="left")
 
-        # BW row
-        bw_row = tk.Frame(self, bg=BG2)
-        bw_row.pack(fill="x", **pad)
-        tk.Label(bw_row, text="BW (kHz)  ", bg=BG2, fg=FG,
-                 font=("Consolas", 8)).pack(side="left")
-        self._bw_var = tk.StringVar(value="10")
-        style = ttk.Style()
-        style.configure("DDR.TCombobox", fieldbackground=ENTRY_BG,
-                        background=BG3, foreground=FG,
-                        selectbackground=SEL_BG, selectforeground="white",
-                        arrowcolor=FG)
-        bw_cb = ttk.Combobox(bw_row, textvariable=self._bw_var,
-                              values=DDR_BW_CHOICES,
-                              font=("Consolas", 8), width=6,
-                              state="readonly", style="DDR.TCombobox")
-        bw_cb.pack(side="left")
-        bw_cb.bind("<<ComboboxSelected>>", lambda _: self._apply())
+            # BW row
+            bw_row = tk.Frame(self, bg=BG2)
+            bw_row.pack(fill="x", **pad)
+            tk.Label(bw_row, text="BW (kHz)  ", bg=BG2, fg=FG,
+                     font=("Consolas", 8)).pack(side="left")
+            self._bw_var = tk.StringVar(value="10")
+            style = ttk.Style()
+            style.configure("DDR.TCombobox", fieldbackground=ENTRY_BG,
+                            background=BG3, foreground=FG,
+                            selectbackground=SEL_BG, selectforeground="white",
+                            arrowcolor=FG)
+            bw_cb = ttk.Combobox(bw_row, textvariable=self._bw_var,
+                                  values=DDR_BW_CHOICES,
+                                  font=("Consolas", 8), width=6,
+                                  state="readonly", style="DDR.TCombobox")
+            bw_cb.pack(side="left")
+            bw_cb.bind("<<ComboboxSelected>>", lambda _: self._apply())
+        else:
+            # Linked NB mode: show a read-only hint instead
+            tk.Label(self, text="fc & BW locked to channel", bg=BG2, fg=FG_DIM,
+                     font=("Consolas", 7), justify="left").pack(
+                anchor="w", padx=6, pady=(4, 0))
 
-        # Mod row
+        # Mod row (always shown)
         mod_row = tk.Frame(self, bg=BG2)
         mod_row.pack(fill="x", **pad)
         tk.Label(mod_row, text="Mod       ", bg=BG2, fg=FG,
@@ -248,19 +365,37 @@ class DDRPanel(tk.LabelFrame):
         mod_cb.pack(side="left")
         mod_cb.bind("<<ComboboxSelected>>", self._on_mod_change)
 
-        # Play button
-        play_row = tk.Frame(self, bg=BG2)
-        play_row.pack(fill="x", padx=4, pady=(2, 5))
-        self._play_btn = tk.Button(play_row, text="Play", font=("Consolas", 8, "bold"),
+        # Play + Rec buttons on same row
+        action_row = tk.Frame(self, bg=BG2)
+        action_row.pack(fill="x", padx=4, pady=(2, 5))
+        self._play_btn = tk.Button(action_row, text="Play", font=("Consolas", 8, "bold"),
                                    bg=BG3, fg=FG_DIM,
                                    activebackground=self._color, activeforeground=BG,
                                    relief="flat", bd=0, padx=10, pady=2,
                                    cursor="hand2", state="disabled",
                                    command=self._toggle_play)
-        self._play_btn.pack(side="left")
+        self._play_btn.pack(side="left", padx=(0, 6))
+        self._rec_btn = tk.Button(action_row, text="Rec", font=("Consolas", 8, "bold"),
+                                  bg=BG3, fg=FG_DIM,
+                                  activebackground="#FF4444", activeforeground="white",
+                                  relief="flat", bd=0, padx=8, pady=2,
+                                  cursor="hand2", state="disabled",
+                                  command=self._toggle_rec)
+        self._rec_btn.pack(side="left")
 
     def set_canvas(self, canvas):
         self._canvas_ref = canvas
+
+    def on_channel_applied(self):
+        """Called by ChannelTab when NB channel Apply fires (linked mode only)."""
+        if self._ddr.recording:
+            self._ddr.stop_recording()
+            self._rec_btn.config(text="Rec", bg=BG3, fg=FG_DIM)
+        self._rec_btn.config(state="normal")
+        mod = self._mod_var.get()
+        self._play_btn.config(
+            state="normal" if (mod != "--") else "disabled"
+        )
 
     def _apply(self):
         try:
@@ -270,13 +405,12 @@ class DDRPanel(tk.LabelFrame):
         except ValueError:
             return
         bw_hz = float(self._bw_var.get()) * 1000
-        was_playing = self._ddr.playing
-        if was_playing:
-            self._ddr.stop_playback()
-        self._ddr.fc_hz = fc_hz
-        self._ddr.bw_hz = bw_hz
-        if was_playing:
-            self._ddr.start_playback()
+        # configure() stops any active recording (fc/bw changed = stale file)
+        self._ddr.configure(fc_hz, bw_hz)
+        if self._ddr.recording:
+            self._rec_btn.config(text="Rec", bg=BG3, fg=FG_DIM)
+        # Rec button enabled as soon as fc is configured (IQ capture is mod-agnostic)
+        self._rec_btn.config(state="normal")
         if self._canvas_ref:
             self._canvas_ref.update_ddr_marker(self._idx, fc_hz, bw_hz)
 
@@ -299,10 +433,21 @@ class DDRPanel(tk.LabelFrame):
             self._ddr.start_playback()
             self._play_btn.config(text="Stop", bg=self._color, fg=BG)
 
+    def _toggle_rec(self):
+        if self._ddr.recording:
+            self._ddr.stop_recording()
+            self._rec_btn.config(text="Rec", bg=BG3, fg=FG_DIM)
+        else:
+            if self._ddr.fc_hz is None:
+                return
+            self._ddr.start_recording()
+            self._rec_btn.config(text="Stop", bg="#FF4444", fg="white")
+
     def _start_tune(self):
-        if self._canvas_ref:
-            self._tune_btn.config(bg=self._color, fg=BG)
-            self._canvas_ref.set_tune_listener(self._on_tune_click)
+        if self._linked or not self._canvas_ref:
+            return
+        self._tune_btn.config(bg=self._color, fg=BG)
+        self._canvas_ref.set_tune_listener(self._on_tune_click)
 
     def _on_tune_click(self, fc_hz: float):
         self._tune_btn.config(bg=BG3, fg=self._color)
@@ -315,11 +460,14 @@ class DDRPanel(tk.LabelFrame):
 
     def destroy(self):
         self._ddr.stop_playback()
+        self._ddr.stop_recording()
         super().destroy()
 
 
 # ── ChannelCanvas ──────────────────────────────────────────────────────────────
 class ChannelCanvas(tk.Frame):
+    _DEFAULT_N_FFT = {"WB": 512, "NB": 1024}
+
     def __init__(self, parent, ch_type: str, color: str):
         super().__init__(parent, bg=BG2)
         self._ch_type  = ch_type
@@ -327,6 +475,8 @@ class ChannelCanvas(tk.Frame):
         self._mask     = None
         self._freqs    = None
         self._tune_cb  = None
+        self._n_fft    = self._DEFAULT_N_FFT.get(ch_type, 512)
+        self._window   = np.blackman(self._n_fft)
 
         # DDR marker artists: list of dicts, one per DDR slot
         self._ddr_artists = []   # filled by add_ddr_markers()
@@ -398,9 +548,11 @@ class ChannelCanvas(tk.Frame):
             self._fig_canvas.get_tk_widget().config(cursor="")
             cb(event.xdata * 1000)
 
-    def setup(self, fc_hz: float, bw_hz: float):
-        n_fft = N_FFT_NB if self._ch_type == "NB" else N_FFT_WB
-        freqs = np.fft.rfftfreq(n_fft, 1 / FS)
+    def setup(self, fc_hz: float, bw_hz: float, n_fft: int = None):
+        if n_fft is not None:
+            self._n_fft  = n_fft
+            self._window = np.blackman(n_fft)
+        freqs = np.fft.rfftfreq(self._n_fft, 1 / FS)
         lo    = fc_hz - bw_hz / 2
         hi    = fc_hz + bw_hz / 2
         self._mask  = (freqs >= lo) & (freqs <= hi)
@@ -408,10 +560,10 @@ class ChannelCanvas(tk.Frame):
 
         fc_k = fc_hz / 1000
         self._ax.set_xlim(lo / 1000, hi / 1000)
-        res = FS / n_fft
+        res = FS / self._n_fft
         self._ax.set_title(
             f"{self._ch_type}  fc={fc_k:.1f} kHz  BW={bw_hz/1000:.1f} kHz"
-            f"  res~{res:.0f} Hz/bin",
+            f"  N={self._n_fft}  res~{res:.0f} Hz/bin",
             color=self._color, fontsize=9,
         )
         self._line.set_data([], [])
@@ -420,10 +572,9 @@ class ChannelCanvas(tk.Frame):
     def refresh(self, ring_wb: np.ndarray, ring_nb: np.ndarray):
         if self._mask is None:
             return
-        if self._ch_type == "NB":
-            mag = _spectrum(ring_nb, _WIN_NB, N_FFT_NB)
-        else:
-            mag = _spectrum(ring_wb, _WIN_WB, N_FFT_WB)
+        ring = ring_nb if self._ch_type == "NB" else ring_wb
+        seg  = ring[-self._n_fft:]
+        mag  = _spectrum(seg, self._window, self._n_fft)
         self._line.set_data(self._freqs, mag[self._mask])
         self._fig_canvas.draw_idle()
 
@@ -464,17 +615,32 @@ class ParamPanel(tk.Frame):
                  width=10, relief="flat", bd=4).grid(
             row=2, column=1, sticky="w", padx=(8, 0))
 
+        fft_default = "1024" if ch_type == "NB" else "512"
+        tk.Label(self, text="FFT Size", bg=BG2, fg=FG,
+                 font=("Consolas", 9)).grid(row=3, column=0, sticky="w", pady=3)
+        self._fft_var = tk.StringVar(value=fft_default)
+        _fft_style = ttk.Style()
+        _fft_style.configure("Param.TCombobox", fieldbackground=ENTRY_BG,
+                             background=BG3, foreground=FG,
+                             selectbackground=SEL_BG, selectforeground="white",
+                             arrowcolor=FG)
+        ttk.Combobox(self, textvariable=self._fft_var,
+                     values=FFT_SIZE_CHOICES,
+                     font=("Consolas", 9), width=8,
+                     state="readonly", style="Param.TCombobox").grid(
+            row=3, column=1, sticky="w", padx=(8, 0), pady=3)
+
         tk.Frame(self, bg=BG3, height=1).grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=8)
+            row=4, column=0, columnspan=2, sticky="ew", pady=8)
 
         tk.Button(self, text="Apply", command=self._apply,
                   bg=ACCENT, fg=FG, activebackground=ACCENT2, activeforeground="white",
                   relief="flat", font=("Consolas", 9), padx=10, pady=4,
-                  cursor="hand2", bd=0).grid(row=4, column=0, columnspan=2, sticky="w")
+                  cursor="hand2", bd=0).grid(row=5, column=0, columnspan=2, sticky="w")
 
         self._info = tk.Label(self, text="", bg=BG2, fg=FG_DIM,
                               font=("Consolas", 8), wraplength=200, justify="left")
-        self._info.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self._info.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
     def _apply(self):
         nyq = FS / 2
@@ -499,13 +665,13 @@ class ParamPanel(tk.Frame):
         except ValueError:
             messagebox.showerror("Input Error", "Bandwidth must be a number.")
             return
-        n_fft = N_FFT_NB if self._ch_type == "NB" else N_FFT_WB
+        n_fft = int(self._fft_var.get())
         res   = FS / n_fft
         self._info.config(
             text=f"fc = {fc_hz/1000:.1f} kHz\nBW = {bw_hz/1000:.1f} kHz"
-                 f"\nres ~ {res:.0f} Hz/bin"
+                 f"\nN = {n_fft}  res ~ {res:.0f} Hz/bin"
         )
-        self._on_apply(fc_hz, bw_hz)
+        self._on_apply(fc_hz, bw_hz, n_fft)
 
 
 # ── ChannelTab ─────────────────────────────────────────────────────────────────
@@ -516,7 +682,8 @@ class ChannelTab(tk.Frame):
         self.ch_type = ch_type
         self._state  = state
         self._active = False
-        self._ddrs: list[DDReceiver] = []
+        self._ddrs:       list[DDReceiver] = []
+        self._ddr_panels: list[DDRPanel]   = []
 
         # Left column: scrollable frame for params + DDR panels
         left_outer = tk.Frame(self, bg=BG2, width=240)
@@ -552,36 +719,49 @@ class ChannelTab(tk.Frame):
         params = ParamPanel(self._left, ch_type=ch_type, on_apply=self._on_apply)
         params.pack(fill="x", pady=(0, 0))
 
-        # DDR panels (WB only)
+        # DDR panels
+        tk.Frame(self._left, bg=BG3, height=1).pack(fill="x", padx=6, pady=6)
         if ch_type == "WB":
-            n_ddrs = 2
-            self._ch_canvas.add_ddr_markers(n_ddrs)
-            tk.Frame(self._left, bg=BG3, height=1).pack(fill="x", padx=6, pady=6)
-            for i in range(n_ddrs):
-                ddr = DDReceiver()
-                self._ddrs.append(ddr)
+            self._ch_canvas.add_ddr_markers(2)
+            for i in range(2):
+                ddr   = DDReceiver()
                 panel = DDRPanel(self._left, idx=i, ddr=ddr,
                                  canvas_ref=self._ch_canvas,
                                  padx=6, pady=6)
                 panel.pack(fill="x", padx=6, pady=(0, 6))
+                self._ddrs.append(ddr)
+                self._ddr_panels.append(panel)
+        elif ch_type == "NB":
+            ddr   = DDReceiver()
+            panel = DDRPanel(self._left, idx=0, ddr=ddr,
+                             canvas_ref=None, linked=True,
+                             padx=6, pady=6)
+            panel.pack(fill="x", padx=6, pady=(0, 6))
+            self._ddrs.append(ddr)
+            self._ddr_panels.append(panel)
 
-    def _on_apply(self, fc_hz: float, bw_hz: float):
-        self._ch_canvas.setup(fc_hz, bw_hz)
+    def _on_apply(self, fc_hz: float, bw_hz: float, n_fft: int):
+        self._ch_canvas.setup(fc_hz, bw_hz, n_fft)
         self._active = True
+        if self.ch_type == "NB" and self._ddrs:
+            self._ddrs[0].configure(fc_hz, bw_hz)
+            self._ddr_panels[0].on_channel_applied()
+
+    def push_chunk(self, chunk: np.ndarray):
+        """Forward each raw UDP chunk to all DDRs for streaming processing."""
+        for ddr in self._ddrs:
+            ddr.push_chunk(chunk)
 
     def update(self):
+        """Refresh the spectrum display (DDR audio is handled per-chunk in push_chunk)."""
         if not self._active:
             return
-        ring_wb = self._state["ring_wb"]
-        ring_nb = self._state["ring_nb"]
-        self._ch_canvas.refresh(ring_wb, ring_nb)
-        for ddr in self._ddrs:
-            if ddr.fc_hz is not None:
-                ddr.process(ring_wb)
+        self._ch_canvas.refresh(self._state["ring_wb"], self._state["ring_nb"])
 
     def destroy(self):
         for ddr in self._ddrs:
             ddr.stop_playback()
+            ddr.stop_recording()
         super().destroy()
 
 
@@ -686,6 +866,8 @@ class ReceiverApp(tk.Tk):
         self.configure(bg=BG)
         self.geometry("1280x760")
 
+        _ensure_recordings_dir()
+
         self._pkt_queue  = queue.Queue(maxsize=400)
         self._stop_event = threading.Event()
         self._channels: dict[str, ChannelTab] = {}
@@ -753,6 +935,9 @@ class ReceiverApp(tk.Tk):
             s["ring_nb"][-CHUNK:]   = chunk
             s["td_buffer"][:-CHUNK] = s["td_buffer"][CHUNK:]
             s["td_buffer"][-CHUNK:] = chunk
+            # Stream each raw chunk through all active channel DDRs immediately
+            for ch in self._channels.values():
+                ch.push_chunk(chunk)
             updated = True
 
         self._overview.update(updated)

@@ -53,9 +53,9 @@ def make_morse_sos() -> np.ndarray:
     freq   = 700.0
     dot    = 0.075
     dash   = 0.225
-    eg     = 0.075   # element gap
-    lg     = 0.225   # letter gap
-    wg     = 0.60    # word gap
+    eg     = 0.075
+    lg     = 0.225
+    wg     = 0.60
 
     def dit():  return _fade(_sine(freq, dot))
     def dah():  return _fade(_sine(freq, dash))
@@ -72,13 +72,12 @@ def make_morse_sos() -> np.ndarray:
     O = letter([dah(), dah(), dah()])
 
     sos = np.concatenate([S, _silence(lg), O, _silence(lg), S, _silence(wg)])
-    # repeat once with a pause
     return _normalise(np.concatenate([sos, sos]))
 
 
-# ── 2. Voice – male  (130 Hz fundamental, speech-rhythm AM) ──────────────────
+# ── 2. Voice – male  (clean harmonic, no noise) ───────────────────────────────
 def make_voice_male() -> np.ndarray:
-    dur = 3.2
+    dur = 3.5
     t   = _t(dur)
     f0  = 130.0
 
@@ -87,20 +86,16 @@ def make_voice_male() -> np.ndarray:
         amp = (1.0 / k) * np.exp(-0.25 * (k - 1))
         sig += amp * np.sin(2 * np.pi * k * f0 * t)
 
-    # syllable rate ≈ 4 Hz, word rate ≈ 1.5 Hz
+    # Smooth syllable envelope — no random noise
     env = (0.5 + 0.5 * np.sin(2 * np.pi * 1.4 * t - 0.3)) \
         * (0.5 + 0.5 * np.sin(2 * np.pi * 4.1 * t + 0.7))
     env = np.clip(env, 0, 1) ** 0.6
 
-    # breathy noise layer (voiced fricatives)
-    noise = np.random.RandomState(1).randn(len(t)) * 0.08
-    sig   = sig * env + noise * env
-
-    sig = _fade(sig, ms=40)
+    sig = _fade(sig * env, ms=40)
     return _normalise(sig)
 
 
-# ── 3. Voice – female  (220 Hz fundamental) ──────────────────────────────────
+# ── 3. Voice – female  (clean harmonic, no noise) ────────────────────────────
 def make_voice_female() -> np.ndarray:
     dur = 3.0
     t   = _t(dur)
@@ -115,23 +110,19 @@ def make_voice_female() -> np.ndarray:
         * (0.3 + 0.7 * np.sin(2 * np.pi * 5.2 * t + 0.2))
     env = np.clip(env, 0, 1) ** 0.5
 
-    noise = np.random.RandomState(2).randn(len(t)) * 0.06
-    sig   = sig * env + noise * env
-
-    sig = _fade(sig, ms=40)
+    sig = _fade(sig * env, ms=40)
     return _normalise(sig)
 
 
-# ── 4. AFSK data burst  (1200 / 2200 Hz, 300 baud, Bell 103-like) ────────────
+# ── 4. AFSK data burst  (1200 / 2200 Hz, 300 baud) ───────────────────────────
 def make_data_afsk() -> np.ndarray:
     baud   = 300
-    f_mark = 1200.0   # '1'
-    f_spc  = 2200.0   # '0'
-    bits_per_sym = 1
+    f_mark = 1200.0
+    f_spc  = 2200.0
     sym_dur = 1.0 / baud
 
     rng  = np.random.RandomState(42)
-    bits = rng.randint(0, 2, int(2.5 * baud))  # ~2.5 s of data
+    bits = rng.randint(0, 2, int(2.5 * baud))
 
     parts = []
     phase = 0.0
@@ -140,7 +131,6 @@ def make_data_afsk() -> np.ndarray:
         n    = int(sym_dur * FS)
         t    = np.arange(n) / FS
         chunk = np.sin(2 * np.pi * freq * t + phase)
-        # maintain phase continuity across symbols
         phase = (phase + 2 * np.pi * freq * sym_dur) % (2 * np.pi)
         parts.append(chunk)
 
@@ -151,12 +141,10 @@ def make_data_afsk() -> np.ndarray:
 
 # ── 5. Radio beacon  (two-tone ID + "DE" in Morse) ───────────────────────────
 def make_radio_beacon() -> np.ndarray:
-    # Two-tone callsign ID
     id_dur = 0.35
     ident  = (_sine(1500, id_dur) + _sine(900, id_dur)) * 0.5
     ident  = _fade(ident, ms=15)
 
-    # "DE" in Morse: D = -.. | E = .
     freq  = 1000.0
     dot   = 0.08
     dash  = 0.24
@@ -177,6 +165,32 @@ def make_radio_beacon() -> np.ndarray:
     return _normalise(sig)
 
 
+# ── 6. Test tone  (440 Hz A4 — easy to identify after demodulation) ──────────
+def make_test_tone() -> np.ndarray:
+    tone = _sine(440.0, 0.45)
+    gap  = _silence(0.12)
+    # Three beeps then a longer one
+    sig = np.concatenate([
+        _fade(tone), gap,
+        _fade(tone), gap,
+        _fade(tone), gap,
+        _fade(_sine(440.0, 1.0)),
+        _silence(0.3),
+    ])
+    return _normalise(sig)
+
+
+# ── 7. Frequency chirp  (200 -> 3000 Hz sweep) ───────────────────────────────
+def make_chirp() -> np.ndarray:
+    dur = 3.0
+    t   = _t(dur)
+    f   = 200 + (3000 - 200) * t / dur
+    phase = 2 * np.pi * np.cumsum(f) / FS
+    sig = np.sin(phase)
+    sig = _fade(sig, ms=50)
+    return _normalise(sig)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     np.random.seed(0)
@@ -186,6 +200,8 @@ if __name__ == "__main__":
         "voice_female.wav": make_voice_female(),
         "data_afsk.wav":    make_data_afsk(),
         "radio_beacon.wav": make_radio_beacon(),
+        "test_tone.wav":    make_test_tone(),
+        "chirp.wav":        make_chirp(),
     }
     for fname, samples in files.items():
         save_wav(fname, samples)
