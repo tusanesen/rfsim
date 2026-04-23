@@ -122,6 +122,7 @@ class App(tk.Tk):
         self.stop_evt    = threading.Event()
         self.pkt_counter = [0]
         self._rate_ts    = time.perf_counter()
+        self._sel_idx    = None   # persists listbox selection across focus changes
 
         self._build_ui()
         self._refresh_list()
@@ -262,7 +263,6 @@ class App(tk.Tk):
 
     # ── List helpers ──────────────────────────────────────────────────────────
     def _refresh_list(self):
-        sel = self._lb.curselection()
         self._lb.delete(0, tk.END)
         with self.sig_lock:
             for s in self.signals:
@@ -271,15 +271,16 @@ class App(tk.Tk):
                     self._lb.itemconfig(tk.END, fg="#555555")
                 elif s.mod_type == "FM":
                     self._lb.itemconfig(tk.END, fg="#FFD700")
-        if sel:
-            self._lb.selection_set(sel[0])
+        if self._sel_idx is not None and self._sel_idx < self._lb.size():
+            self._lb.selection_set(self._sel_idx)
 
     def _on_select(self, _=None):
         sel = self._lb.curselection()
         if not sel:
             return
+        self._sel_idx = sel[0]
         with self.sig_lock:
-            s = self.signals[sel[0]]
+            s = self.signals[self._sel_idx]
         self._mod_type.set(s.mod_type)
         self._on_type_change()
         self._entries["label"].delete(0, tk.END);  self._entries["label"].insert(0, s.label)
@@ -339,38 +340,31 @@ class App(tk.Tk):
         self._lb.see(tk.END)
 
     def _update_signal(self):
-        sel = self._lb.curselection()
-        if not sel:
+        if self._sel_idx is None:
             messagebox.showinfo("No Selection", "Select a signal in the list first.")
             return
         s = self._parse_form()
         if s is None:
             return
-        idx = sel[0]
         with self.sig_lock:
-            s.enabled = self.signals[idx].enabled
-            self.signals[idx] = s
+            s.enabled = self.signals[self._sel_idx].enabled
+            self.signals[self._sel_idx] = s
         self._refresh_list()
-        self._lb.selection_set(idx)
 
     def _remove_signal(self):
-        sel = self._lb.curselection()
-        if not sel:
+        if self._sel_idx is None:
             return
-        idx = sel[0]
         with self.sig_lock:
-            self.signals.pop(idx)
+            self.signals.pop(self._sel_idx)
+        self._sel_idx = None
         self._refresh_list()
 
     def _toggle_signal(self):
-        sel = self._lb.curselection()
-        if not sel:
+        if self._sel_idx is None:
             return
-        idx = sel[0]
         with self.sig_lock:
-            self.signals[idx].enabled = not self.signals[idx].enabled
+            self.signals[self._sel_idx].enabled = not self.signals[self._sel_idx].enabled
         self._refresh_list()
-        self._lb.selection_set(idx)
 
     # ── Noise & status tick ───────────────────────────────────────────────────
     def _on_noise(self, _=None):
