@@ -7,7 +7,8 @@
       "Bash(echo \"EXIT:$?\")",
       "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/pip list *)",
       "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/pip.exe list *)",
-      "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/python.exe *)"
+      "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/python.exe *)",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
     ]
   }
 }

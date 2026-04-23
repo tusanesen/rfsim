@@ -1,6 +1,6 @@
 """
-AM Signal Capture & Spectrum Visualizer
-Receives UDP chunks from am_simulation.py, maintains a ring buffer,
+Signal Capture & Spectrum Visualizer
+Receives UDP chunks from signal_gen.py, maintains a ring buffer,
 and displays a live FFT spectrum + rolling time-domain waveform.
 """
 
@@ -12,8 +12,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
 
-from config import (FS, N_FFT, CHUNK, F_LO, F_HI,
-                    SIGNALS, COLORS, UDP_HOST, UDP_PORT)
+from config import FS, N_FFT, CHUNK, F_LO, F_HI, UDP_HOST, UDP_PORT
 
 PACKET_BYTES = CHUNK * 4       # float32
 TD_SECS      = 0.010           # time-domain strip length: 10 ms
@@ -73,11 +72,6 @@ def build_figure():
     ax_spec.tick_params(colors="gray")
     ax_spec.grid(True, color="#2a2a2a", linewidth=0.6)
     ax_spec.set_title("Waiting for signal...", color="#555555", fontsize=9)
-
-    for (fc, fm, m, label), color in zip(SIGNALS, COLORS):
-        ax_spec.axvline(fc / 1000, color=color, linestyle="--", alpha=0.5, linewidth=0.8)
-        ax_spec.text(fc / 1000, 5, f"{fc/1000:.0f} kHz\n{label}",
-                     color=color, fontsize=7.5, ha="center", va="bottom")
 
     spec_line, = ax_spec.plot([], [], color="#00BFFF", linewidth=0.9, animated=True)
 
