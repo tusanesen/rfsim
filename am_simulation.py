@@ -136,7 +136,7 @@ ax_td.set_facecolor("#0a0a0a")
 ax_td.grid(True, color="#222", linewidth=0.4)
 ax_td.set_xlabel("µs", color="gray", fontsize=5)
 
-plt.savefig("C:/pytest/am_spectrum.png", dpi=150, bbox_inches="tight",
+plt.savefig("am_spectrum.png", dpi=150, bbox_inches="tight",
             facecolor=fig.get_facecolor())
 plt.show()
-print("Plot saved -> C:/pytest/am_spectrum.png")
+print("Plot saved -> am_spectrum.png")

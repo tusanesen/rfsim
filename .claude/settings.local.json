@@ -4,7 +4,10 @@
       "Bash(python -c \"import numpy, scipy, matplotlib; print\\('numpy:', numpy.__version__\\); print\\('scipy:', scipy.__version__\\); print\\('matplotlib:', matplotlib.__version__\\)\")",
       "Bash(python:*)",
       "Bash(pip install:*)",
-      "Bash(echo \"EXIT:$?\")"
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/pip list *)",
+      "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/pip.exe list *)",
+      "Bash(C:/code/ssprojects/rfsim/.venv/Scripts/python.exe *)"
     ]
   }
 }
