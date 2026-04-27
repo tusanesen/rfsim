@@ -81,7 +81,7 @@ class SignalBase(ABC):
     def common_field_specs(cls) -> list:
         return [
             FieldSpec("label", "Label",         "SIG"),
-            FieldSpec("fc",    "Carrier (kHz)", "100"),
+            FieldSpec("fc",    "Carrier (MHz)", "5"),
             FieldSpec("amp",   "Amplitude",     "1.0"),
         ]
 
@@ -104,9 +104,9 @@ class SignalBase(ABC):
         errors = []
         nyq = FS / 2
         try:
-            fc = float(values["fc"]) * 1000
-            if not (0 < fc < nyq):
-                errors.append(f"Carrier must be between 0 and {nyq/1000:.0f} kHz.")
+            fc = float(values["fc"]) * 1e6
+            if not (-nyq < fc < nyq):
+                errors.append(f"Carrier must be in (-{nyq/1e6:.1f}, +{nyq/1e6:.1f}) MHz.")
         except (ValueError, KeyError):
             errors.append("Carrier must be a number.")
         try:
@@ -171,7 +171,7 @@ class AMSignal(SignalBase):
     def from_form(cls, v: dict) -> "AMSignal":
         return cls(
             label     = v["label"].strip() or "SIG",
-            fc        = float(v["fc"])        * 1000,
+            fc        = float(v["fc"])        * 1e6,
             fm        = float(v["fm"])        * 1000,
             mod_index = float(v["mod_index"]),
             amplitude = float(v["amp"]),
@@ -198,7 +198,7 @@ class AMSignal(SignalBase):
     def to_form(self) -> dict:
         return {
             "label":     self.label,
-            "fc":        f"{self.fc/1000:.3f}",
+            "fc":        f"{self.fc/1e6:.3f}",
             "amp":       f"{self.amplitude:.2f}",
             "fm":        f"{self.fm/1000:.4f}",
             "mod_index": f"{self.mod_index:.3f}",
@@ -211,12 +211,13 @@ class AMSignal(SignalBase):
             m   = self._samples[idx]
         else:
             m = np.cos(TWO_PI * self.fm * t)
-        return self.amplitude * (1.0 + self.mod_index * m) * np.cos(TWO_PI * self.fc * t)
+        env = self.amplitude * (1.0 + self.mod_index * m)
+        return (env * np.exp(1j * TWO_PI * self.fc * t)).astype(np.complex64)
 
     def describe(self) -> str:
         wav = f"  [{self.wav_file}]" if self._samples is not None else ""
         return (f"{self._tag()} [AM]  {self.label:<6}  "
-                f"fc={self.fc/1000:.1f}kHz  fm={self.fm/1000:.2f}kHz  "
+                f"fc={self.fc/1e6:+.3f}MHz  fm={self.fm/1000:.2f}kHz  "
                 f"m={self.mod_index:.2f}  A={self.amplitude:.2f}{wav}")
 
 
@@ -259,7 +260,7 @@ class FMSignal(SignalBase):
     def from_form(cls, v: dict) -> "FMSignal":
         return cls(
             label     = v["label"].strip() or "SIG",
-            fc        = float(v["fc"])        * 1000,
+            fc        = float(v["fc"])        * 1e6,
             fm        = float(v["fm"])        * 1000,
             deviation = float(v["deviation"]),
             amplitude = float(v["amp"]),
@@ -286,7 +287,7 @@ class FMSignal(SignalBase):
     def to_form(self) -> dict:
         return {
             "label":     self.label,
-            "fc":        f"{self.fc/1000:.3f}",
+            "fc":        f"{self.fc/1e6:.3f}",
             "amp":       f"{self.amplitude:.2f}",
             "fm":        f"{self.fm/1000:.4f}",
             "deviation": f"{self.deviation:.1f}",
@@ -300,17 +301,16 @@ class FMSignal(SignalBase):
             full_loops = idx // n
             within_idx = idx % n
             phase_int  = self._cumsum[within_idx] + full_loops * self._loop_integral
-            return self.amplitude * np.cos(TWO_PI * self.fc * t
-                                            + TWO_PI * self.deviation * phase_int)
+            phase = TWO_PI * self.fc * t + TWO_PI * self.deviation * phase_int
         else:
-            beta = self.deviation / self.fm
-            return self.amplitude * np.cos(TWO_PI * self.fc * t
-                                           + beta * np.sin(TWO_PI * self.fm * t))
+            beta  = self.deviation / self.fm
+            phase = TWO_PI * self.fc * t + beta * np.sin(TWO_PI * self.fm * t)
+        return (self.amplitude * np.exp(1j * phase)).astype(np.complex64)
 
     def describe(self) -> str:
         wav = f"  [{self.wav_file}]" if self._samples is not None else ""
         return (f"{self._tag()} [FM]  {self.label:<6}  "
-                f"fc={self.fc/1000:.1f}kHz  fm={self.fm/1000:.2f}kHz  "
+                f"fc={self.fc/1e6:+.3f}MHz  fm={self.fm/1000:.2f}kHz  "
                 f"dev={self.deviation/1000:.1f}kHz  A={self.amplitude:.2f}{wav}")
 
 
@@ -340,7 +340,7 @@ class ASKSignal(SignalBase):
     def from_form(cls, v: dict) -> "ASKSignal":
         return cls(
             label     = v["label"].strip() or "SIG",
-            fc        = float(v["fc"])        * 1000,
+            fc        = float(v["fc"])        * 1e6,
             bitrate   = float(v["bitrate"]),
             low_level = float(v["low_level"]),
             amplitude = float(v["amp"]),
@@ -366,7 +366,7 @@ class ASKSignal(SignalBase):
     def to_form(self) -> dict:
         return {
             "label":     self.label,
-            "fc":        f"{self.fc/1000:.3f}",
+            "fc":        f"{self.fc/1e6:.3f}",
             "amp":       f"{self.amplitude:.2f}",
             "bitrate":   f"{self.bitrate:.0f}",
             "low_level": f"{self.low_level:.2f}",
@@ -376,12 +376,12 @@ class ASKSignal(SignalBase):
         bit_idx  = (t * self.bitrate).astype(np.int64) % len(_PRBS)
         bits     = _PRBS[bit_idx]
         envelope = np.where(bits, self.amplitude, self.amplitude * self.low_level)
-        return envelope * np.cos(TWO_PI * self.fc * t)
+        return (envelope * np.exp(1j * TWO_PI * self.fc * t)).astype(np.complex64)
 
     def describe(self) -> str:
         mode = "OOK" if self.low_level == 0.0 else "2-ASK"
         return (f"{self._tag()} [ASK] {self.label:<6}  "
-                f"fc={self.fc/1000:.1f}kHz  br={self.bitrate:.0f}bps  "
+                f"fc={self.fc/1e6:+.3f}MHz  br={self.bitrate:.0f}bps  "
                 f"lo={self.low_level:.2f} ({mode})  A={self.amplitude:.2f}")
 
 
@@ -389,12 +389,12 @@ class ASKSignal(SignalBase):
 def default_signals() -> list:
     wavs = _list_wav_files()
     return [
-        AMSignal( "CH1",  60_000,  1_000, 0.50),
-        AMSignal( "CH2",  90_000,  2_500, 0.70),
-        AMSignal( "CH3", 130_000,  5_000, 0.40),
-        FMSignal( "CH4", 170_000, 10_000, 8_000),
-        ASKSignal("CH5", 210_000,  2_000, 0.0),
-        AMSignal( "CH6",  80_000,  1_000, 0.85, wav_file=wavs[0] if wavs else _WAV_DEFAULT),
-        FMSignal( "CH7", 150_000,  5_000, 6_000,
+        AMSignal( "CH1", -15_000_000,  1_000, 0.50),
+        AMSignal( "CH2", -10_000_000,  2_500, 0.70),
+        AMSignal( "CH3",  -5_000_000,  5_000, 0.40),
+        FMSignal( "CH4",           0, 10_000, 8_000),
+        ASKSignal("CH5",   5_000_000,  2_000, 0.0),
+        AMSignal( "CH6",  10_000_000,  1_000, 0.85, wav_file=wavs[0] if wavs else _WAV_DEFAULT),
+        FMSignal( "CH7",  15_000_000,  5_000, 6_000,
                   wav_file=wavs[1] if len(wavs) > 1 else _WAV_DEFAULT),
     ]

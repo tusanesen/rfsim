@@ -1,9 +1,14 @@
 """
-Signal Capture & Spectrum Visualizer  —  with Monitoring Receiver Channels + DDR
-Receives UDP chunks from signal_gen.py. Provides:
-  - Overview tab: live spectrum + time-domain strip
+Signal Capture & Spectrum Visualizer  -  with Monitoring Receiver Channels + DDR
+Receives complex64 IQ chunks from signal_gen.py over UDP. Provides:
+  - Overview tab: live two-sided spectrum + time-domain strip (I component)
   - WB/NB channel tabs: per-channel spectrum view
   - DDR sub-channels (WB only): DDC -> Demodulator -> Speaker pipeline
+  - Recordings tab: list and visualise saved IQ files
+
+Frequency display: internal math is in baseband Hz (signed, +/- FS/2). The
+spectrum/DDR/Channel UIs render with a fixed +DISPLAY_OFFSET_HZ (default
++150 MHz) cosmetic offset so users see the simulated VUHF carrier band.
 """
 
 import collections
@@ -22,10 +27,15 @@ import matplotlib.gridspec as gridspec
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import sounddevice as sd
 
-from config import FS, N_FFT, CHUNK, F_LO, F_HI, UDP_HOST, UDP_PORT
+from config import FS, N_FFT, CHUNK, F_LO, F_HI, DISPLAY_OFFSET_HZ, UDP_HOST, UDP_PORT
 
 RECORDINGS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 _MAX_REC_BYTES  = 10 * 1024 ** 3   # 10 GB
+
+
+def _hz_to_display_mhz(f_hz):
+    """Apply cosmetic display offset and convert to MHz."""
+    return (f_hz + DISPLAY_OFFSET_HZ) / 1e6
 
 
 def _ensure_recordings_dir():
@@ -50,23 +60,24 @@ def _ensure_recordings_dir():
 plt.style.use("dark_background")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-PACKET_BYTES = CHUNK * 4
-TD_SECS      = 0.010
+PACKET_BYTES = CHUNK * 8        # complex64 = 8 bytes/sample
+TD_SECS      = 0.001            # 1 ms time-domain strip (40k samples at FS=40 MHz)
 TD_SAMPLES   = int(FS * TD_SECS)
 INTERVAL_MS  = 33
 
-N_FFT_WB = N_FFT        # 4096  -> ~122 Hz/bin
-N_FFT_NB = 32_768       # 32768 -> ~15  Hz/bin
+N_FFT_WB = N_FFT        # 4096  -> ~9.8 kHz/bin at FS=40 MHz
+N_FFT_NB = 32_768       # 32768 -> ~1.2 kHz/bin
 
-_freqs_ov  = np.fft.rfftfreq(N_FFT_WB, 1 / FS)
+# Two-sided spectrum frequency vector (signed Hz, baseband).
+_freqs_ov  = np.fft.fftshift(np.fft.fftfreq(N_FFT_WB, 1 / FS))
 _ov_mask   = (_freqs_ov >= F_LO) & (_freqs_ov <= F_HI)
-OV_FREQS   = _freqs_ov[_ov_mask] / 1000.0
+OV_FREQS   = _hz_to_display_mhz(_freqs_ov[_ov_mask])
 
 _WIN_WB = np.blackman(N_FFT_WB)
 _WIN_NB = np.blackman(N_FFT_NB)
 
-DDR_BW_CHOICES  = ["5", "10", "25", "50"]      # kHz
-DDR_MOD_CHOICES = ["--", "AM", "FM", "ASK"]
+DDR_BW_CHOICES   = ["5", "10", "25", "50"]      # kHz (sub-channel BWs)
+DDR_MOD_CHOICES  = ["--", "AM", "FM", "ASK"]
 FFT_SIZE_CHOICES = ["64", "128", "256", "512", "1024"]
 
 # DDR slot colours
@@ -100,7 +111,7 @@ def _receiver_thread(pkt_queue: queue.Queue, stop_event: threading.Event):
         try:
             data, _ = sock.recvfrom(PACKET_BYTES)
             if len(data) == PACKET_BYTES:
-                chunk = np.frombuffer(data, dtype=np.float32)
+                chunk = np.frombuffer(data, dtype=np.complex64)
                 if not pkt_queue.full():
                     pkt_queue.put_nowait(chunk)
         except socket.timeout:
@@ -110,7 +121,8 @@ def _receiver_thread(pkt_queue: queue.Queue, stop_event: threading.Event):
 
 # ── Spectrum helpers ───────────────────────────────────────────────────────────
 def _spectrum(ring: np.ndarray, window: np.ndarray, n_fft: int) -> np.ndarray:
-    X = np.fft.rfft(ring * window)
+    """Two-sided magnitude spectrum (dBFS), already fftshift'd to centre DC."""
+    X = np.fft.fftshift(np.fft.fft(ring * window))
     return 20 * np.log10(np.abs(X) / n_fft + 1e-12)
 
 
@@ -152,6 +164,8 @@ class DDReceiver:
 
     FM continuity: _prev_fm_angle carries the last unwrapped phase forward
     so there are no click artefacts at chunk boundaries.
+
+    Input chunks are already complex64 IQ (no Hilbert transform needed).
     """
 
     def __init__(self):
@@ -159,7 +173,7 @@ class DDReceiver:
         self.bw_hz    = 10_000.0
         self.mod_type = None
         self._playing = False
-        self._dec     = 50                              # FS / bw_hz
+        self._dec     = 4_000                          # FS / bw_hz
         self._fs_out  = 10_000.0                       # bw_hz
         self._t_abs   = 0                              # absolute sample counter
         self._leftover = np.empty(0, dtype=np.complex128)  # fractional-dec remainder
@@ -204,10 +218,10 @@ class DDReceiver:
         if self.fc_hz is None:
             return
 
-        # Phase-continuous complex mix to baseband
+        # Phase-continuous complex mix to baseband (chunk is already complex IQ).
         t  = (np.arange(CHUNK, dtype=np.float64) + (self._t_abs - CHUNK)) / FS
         lo = np.exp(-1j * 2 * np.pi * self.fc_hz * t)
-        bb = chunk.astype(np.float64) * lo
+        bb = chunk.astype(np.complex128) * lo
 
         # Integrate-and-dump decimation with leftover tracking
         dec  = self._dec
@@ -278,12 +292,13 @@ class DDReceiver:
         self._prev_fm_angle = 0.0
 
     def start_recording(self):
-        """Open a new binary IQ file. Filename encodes fc, sample-rate, and timestamp."""
+        """Open a new binary IQ file. Filename encodes baseband fc, sample-rate, and timestamp."""
         self.stop_recording()
         if self.fc_hz is None:
             return
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fc_k = int(self.fc_hz / 1000)
+        # Baseband fc may be negative — int() truncates towards zero, so use round.
+        fc_k = int(round(self.fc_hz / 1000))
         sr_k = int(self._fs_out / 1000)
         name = f"IQ_{fc_k}kHz_SR{sr_k}kHz_{ts}.bin"
         path = os.path.join(RECORDINGS_DIR, name)
@@ -327,15 +342,15 @@ class DDRPanel(tk.LabelFrame):
         pad = {"padx": 4, "pady": 3}
 
         if not self._linked:
-            # Freq row
+            # Freq row (display MHz, includes the +150 MHz cosmetic offset)
             freq_row = tk.Frame(self, bg=BG2)
             freq_row.pack(fill="x", **pad)
-            tk.Label(freq_row, text="Freq (kHz)", bg=BG2, fg=FG,
+            tk.Label(freq_row, text="Freq (MHz)", bg=BG2, fg=FG,
                      font=("Consolas", 8)).pack(side="left")
             self._fc_var = tk.StringVar()
             self._fc_entry = tk.Entry(freq_row, textvariable=self._fc_var,
                                       bg=ENTRY_BG, fg=FG, insertbackground=FG,
-                                      font=("Consolas", 9), width=8,
+                                      font=("Consolas", 9), width=10,
                                       relief="flat", bd=3)
             self._fc_entry.pack(side="left", padx=(4, 4))
             self._fc_entry.bind("<Return>", lambda _: self._apply())
@@ -449,9 +464,11 @@ class DDRPanel(tk.LabelFrame):
                                   bg=BG3, fg=FG_DIM)
 
     def _apply(self):
+        # Field is in display MHz; subtract DISPLAY_OFFSET to get baseband Hz.
         try:
-            fc_hz = float(self._fc_var.get()) * 1000
-            if not (0 < fc_hz < FS / 2):
+            fc_disp_mhz = float(self._fc_var.get())
+            fc_hz       = fc_disp_mhz * 1e6 - DISPLAY_OFFSET_HZ
+            if not (-FS / 2 < fc_hz < FS / 2):
                 return
         except ValueError:
             return
@@ -499,15 +516,6 @@ class DDRPanel(tk.LabelFrame):
         self._size_lbl.config(text=_fmt_size(self._ddr.rec_bytes))
         self._size_after_id = self.after(500, self._poll_rec_size)
 
-    def destroy(self):
-        if self._size_after_id is not None:
-            try:
-                self.after_cancel(self._size_after_id)
-            except Exception:
-                pass
-            self._size_after_id = None
-        super().destroy()
-
     def _start_tune(self):
         if self._linked or not self._canvas_ref:
             return
@@ -515,15 +523,19 @@ class DDRPanel(tk.LabelFrame):
         self._canvas_ref.set_tune_listener(self._on_tune_click)
 
     def _on_tune_click(self, fc_hz: float):
+        # fc_hz arrives as baseband Hz (canvas already subtracted DISPLAY_OFFSET).
         self._tune_btn.config(bg=BG3, fg=self._color)
-        self._fc_var.set(f"{fc_hz/1000:.2f}")
+        fc_disp_mhz = (fc_hz + DISPLAY_OFFSET_HZ) / 1e6
+        self._fc_var.set(f"{fc_disp_mhz:.3f}")
         self._apply()
-        mod = self._mod_var.get()
-        self._play_btn.config(
-            state="normal" if (mod != "--") else "disabled"
-        )
 
     def destroy(self):
+        if self._size_after_id is not None:
+            try:
+                self.after_cancel(self._size_after_id)
+            except Exception:
+                pass
+            self._size_after_id = None
         self._ddr.stop_playback()
         self._ddr.stop_recording()
         super().destroy()
@@ -549,7 +561,7 @@ class ChannelCanvas(tk.Frame):
         fig = plt.Figure(figsize=(9, 5), facecolor="#0d0d0d")
         ax  = fig.add_subplot(111)
         ax.set_facecolor("#111111")
-        ax.set_xlabel("Frequency (kHz)", color="gray")
+        ax.set_xlabel("Frequency (MHz)", color="gray")
         ax.set_ylabel("Power (dBFS)", color="gray")
         ax.tick_params(colors="gray")
         ax.grid(True, color="#2a2a2a", linewidth=0.6)
@@ -580,17 +592,17 @@ class ChannelCanvas(tk.Frame):
     def update_ddr_marker(self, idx: int, fc_hz: float, bw_hz: float):
         if idx >= len(self._ddr_artists):
             return
-        m   = self._ddr_artists[idx]
-        fc_k = fc_hz / 1000
-        lo_k = (fc_hz - bw_hz / 2) / 1000
-        hi_k = (fc_hz + bw_hz / 2) / 1000
-        m["vline"].set_xdata([fc_k, fc_k])
+        m    = self._ddr_artists[idx]
+        fc_d = _hz_to_display_mhz(fc_hz)
+        lo_d = _hz_to_display_mhz(fc_hz - bw_hz / 2)
+        hi_d = _hz_to_display_mhz(fc_hz + bw_hz / 2)
+        m["vline"].set_xdata([fc_d, fc_d])
         m["vline"].set_visible(True)
         # mpl >= 3.7: axvspan returns a Rectangle, not a Polygon — use x/width.
-        m["span"].set_x(lo_k)
-        m["span"].set_width(hi_k - lo_k)
+        m["span"].set_x(lo_d)
+        m["span"].set_width(hi_d - lo_d)
         m["span"].set_visible(True)
-        m["label"].set_x(fc_k)
+        m["label"].set_x(fc_d)
         m["label"].set_visible(True)
         self._fig_canvas.draw_idle()
 
@@ -612,23 +624,26 @@ class ChannelCanvas(tk.Frame):
             cb = self._tune_cb
             self._tune_cb = None
             self._fig_canvas.get_tk_widget().config(cursor="")
-            cb(event.xdata * 1000)
+            # event.xdata is in display MHz — convert to baseband Hz.
+            fc_hz = event.xdata * 1e6 - DISPLAY_OFFSET_HZ
+            cb(fc_hz)
 
     def setup(self, fc_hz: float, bw_hz: float, n_fft: int = None):
         if n_fft is not None:
             self._n_fft  = n_fft
             self._window = np.blackman(n_fft)
-        freqs = np.fft.rfftfreq(self._n_fft, 1 / FS)
+        # Two-sided baseband freq vector (signed, fftshift-ordered).
+        freqs = np.fft.fftshift(np.fft.fftfreq(self._n_fft, 1 / FS))
         lo    = fc_hz - bw_hz / 2
         hi    = fc_hz + bw_hz / 2
         self._mask  = (freqs >= lo) & (freqs <= hi)
-        self._freqs = freqs[self._mask] / 1000.0
+        self._freqs = _hz_to_display_mhz(freqs[self._mask])
 
-        fc_k = fc_hz / 1000
-        self._ax.set_xlim(lo / 1000, hi / 1000)
+        fc_d = _hz_to_display_mhz(fc_hz)
+        self._ax.set_xlim(_hz_to_display_mhz(lo), _hz_to_display_mhz(hi))
         res = FS / self._n_fft
         self._ax.set_title(
-            f"{self._ch_type}  fc={fc_k:.1f} kHz  BW={bw_hz/1000:.1f} kHz"
+            f"{self._ch_type}  fc={fc_d:.3f} MHz  BW={bw_hz/1000:.1f} kHz"
             f"  N={self._n_fft}  res~{res:.0f} Hz/bin",
             color=self._color, fontsize=9,
         )
@@ -647,7 +662,12 @@ class ChannelCanvas(tk.Frame):
 
 # ── ParamPanel ─────────────────────────────────────────────────────────────────
 class ParamPanel(tk.Frame):
-    _BW_LIMITS = {"WB": (20_000, 200_000), "NB": (1_000, 20_000)}
+    # WB BW range is wider now (sub-channels of the 40 MHz receiver).
+    # Limits in Hz; UI units differ per type to keep typing readable.
+    _BW_LIMITS = {"WB": (1_000_000, 40_000_000),     # 1-40 MHz
+                  "NB": (1_000,    200_000)}          # 1-200 kHz
+    _BW_UNITS  = {"WB": ("MHz", 1e6, "1"),            # (label_unit, scale, default)
+                  "NB": ("kHz", 1e3, "10")}
 
     def __init__(self, parent, ch_type: str, on_apply):
         super().__init__(parent, bg=BG2, padx=14, pady=10, width=230)
@@ -655,24 +675,32 @@ class ParamPanel(tk.Frame):
         self._ch_type  = ch_type
         self._on_apply = on_apply
 
-        lo, hi  = self._BW_LIMITS[ch_type]
-        bw_hint = f"{lo//1000} - {hi//1000} kHz"
-        bw_def  = "60" if ch_type == "WB" else "10"
+        bw_unit, bw_scale, bw_def = self._BW_UNITS[ch_type]
+        self._bw_scale = bw_scale
+        lo, hi = self._BW_LIMITS[ch_type]
+        bw_hint = f"{lo/bw_scale:g} - {hi/bw_scale:g} {bw_unit}"
         hdr_col = "#00BFFF" if ch_type == "WB" else "#00FF9F"
+
+        # Default centre freq matches the visible band centre (display 150 MHz).
+        fc_def_disp_mhz = (DISPLAY_OFFSET_HZ) / 1e6   # 150
+        if ch_type == "WB":
+            fc_def_str = f"{fc_def_disp_mhz:g}"
+        else:
+            fc_def_str = f"{fc_def_disp_mhz + 5:g}"   # 155 MHz default for NB
 
         tk.Label(self, text=f"{ch_type} Receiver", bg=BG2, fg=hdr_col,
                  font=("Consolas", 10, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-        tk.Label(self, text="Center Freq (kHz)", bg=BG2, fg=FG,
+        tk.Label(self, text="Center Freq (MHz)", bg=BG2, fg=FG,
                  font=("Consolas", 9)).grid(row=1, column=0, sticky="w", pady=3)
-        self._fc_var = tk.StringVar(value="100")
+        self._fc_var = tk.StringVar(value=fc_def_str)
         tk.Entry(self, textvariable=self._fc_var, bg=ENTRY_BG, fg=FG,
                  insertbackground=FG, font=("Consolas", 9),
                  width=10, relief="flat", bd=4).grid(
             row=1, column=1, sticky="w", padx=(8, 0))
 
-        tk.Label(self, text=f"Bandwidth (kHz)\n({bw_hint})", bg=BG2, fg=FG,
+        tk.Label(self, text=f"Bandwidth ({bw_unit})\n({bw_hint})", bg=BG2, fg=FG,
                  font=("Consolas", 9), justify="left").grid(
             row=2, column=0, sticky="w", pady=3)
         self._bw_var = tk.StringVar(value=bw_def)
@@ -716,21 +744,28 @@ class ParamPanel(tk.Frame):
     def _apply(self):
         nyq = FS / 2
         try:
-            fc_hz = float(self._fc_var.get()) * 1000
-            if not (0 < fc_hz < nyq):
-                messagebox.showerror("Input Error",
-                                     f"Center freq must be 0 - {nyq/1000:.0f} kHz.")
+            fc_disp_mhz = float(self._fc_var.get())
+            fc_hz       = fc_disp_mhz * 1e6 - DISPLAY_OFFSET_HZ
+            if not (-nyq < fc_hz < nyq):
+                lo_d = _hz_to_display_mhz(-nyq)
+                hi_d = _hz_to_display_mhz(nyq)
+                messagebox.showerror(
+                    "Input Error",
+                    f"Center freq must be {lo_d:.1f} - {hi_d:.1f} MHz."
+                )
                 return
         except ValueError:
             messagebox.showerror("Input Error", "Center freq must be a number.")
             return
         lo, hi = self._BW_LIMITS[self._ch_type]
         try:
-            bw_hz = float(self._bw_var.get()) * 1000
+            bw_hz = float(self._bw_var.get()) * self._bw_scale
             if not (lo <= bw_hz <= hi):
+                bw_unit = self._BW_UNITS[self._ch_type][0]
                 messagebox.showerror(
                     "Input Error",
-                    f"Bandwidth must be {lo//1000}-{hi//1000} kHz for {self._ch_type}.",
+                    f"Bandwidth must be {lo/self._bw_scale:g}-{hi/self._bw_scale:g} "
+                    f"{bw_unit} for {self._ch_type}.",
                 )
                 return
         except ValueError:
@@ -739,7 +774,7 @@ class ParamPanel(tk.Frame):
         n_fft = int(self._fft_var.get())
         res   = FS / n_fft
         self._info.config(
-            text=f"fc = {fc_hz/1000:.1f} kHz\nBW = {bw_hz/1000:.1f} kHz"
+            text=f"fc = {fc_disp_mhz:.3f} MHz\nBW = {bw_hz/1000:.1f} kHz"
                  f"\nN = {n_fft}  res ~ {res:.0f} Hz/bin"
         )
         self._on_apply(fc_hz, bw_hz, n_fft)
@@ -857,9 +892,9 @@ class OverviewTab(tk.Frame):
         ax_td = fig.add_subplot(gs[1])
 
         ax_sp.set_facecolor("#111111")
-        ax_sp.set_xlim(F_LO / 1000, F_HI / 1000)
+        ax_sp.set_xlim(_hz_to_display_mhz(F_LO), _hz_to_display_mhz(F_HI))
         ax_sp.set_ylim(-90, 10)
-        ax_sp.set_xlabel("Frequency (kHz)", color="gray")
+        ax_sp.set_xlabel("Frequency (MHz)", color="gray")
         ax_sp.set_ylabel("Power (dBFS)", color="gray")
         ax_sp.tick_params(colors="gray")
         ax_sp.grid(True, color="#2a2a2a", linewidth=0.6)
@@ -869,10 +904,10 @@ class OverviewTab(tk.Frame):
         ax_td.set_xlim(0, TD_SECS * 1000)
         ax_td.set_ylim(-6, 6)
         ax_td.set_xlabel("Time (ms)", color="gray", fontsize=9)
-        ax_td.set_ylabel("Amplitude", color="gray", fontsize=9)
+        ax_td.set_ylabel("I", color="gray", fontsize=9)
         ax_td.tick_params(colors="gray", labelsize=7)
         ax_td.grid(True, color="#222222", linewidth=0.4)
-        ax_td.set_title("Composite waveform (rolling 10 ms)",
+        ax_td.set_title(f"In-phase component (rolling {TD_SECS*1000:.1f} ms)",
                         color="#888888", fontsize=8)
 
         t_ms = np.linspace(0, TD_SECS * 1000, TD_SAMPLES)
@@ -893,13 +928,17 @@ class OverviewTab(tk.Frame):
             self._got_signal = True
         mag = _spectrum(self._state["ring_wb"], _WIN_WB, N_FFT_WB)
         self._spec_line.set_data(OV_FREQS, mag[_ov_mask])
-        self._td_line.set_ydata(self._state["td_buffer"])
+        # td_buffer is complex IQ; show I component on the strip plot.
+        self._td_line.set_ydata(self._state["td_buffer"].real)
         self._canvas.draw_idle()
 
 
 # ── RecordingsTab ──────────────────────────────────────────────────────────────
 def _parse_iq_filename(name: str) -> tuple[float | None, float | None]:
-    """Parse (fc_hz, sr_hz) from IQ_<fc>kHz_SR<sr>kHz_<ts>.bin filenames."""
+    """Parse (fc_hz, sr_hz) from IQ_<fc>kHz_SR<sr>kHz_<ts>.bin filenames.
+
+    fc may be signed (e.g. IQ_-5000kHz_SR25kHz_*.bin for -5 MHz baseband).
+    """
     try:
         parts = name.split("_")
         fc_part, sr_part = parts[1], parts[2]
@@ -1105,10 +1144,11 @@ class ReceiverApp(tk.Tk):
         self._stop_event = threading.Event()
         self._channels: dict[str, ChannelTab] = {}
 
+        # Ring buffers and time-domain strip are now complex IQ.
         self._state = {
-            "ring_wb":   np.zeros(N_FFT_WB),
-            "ring_nb":   np.zeros(N_FFT_NB),
-            "td_buffer": np.zeros(TD_SAMPLES),
+            "ring_wb":   np.zeros(N_FFT_WB,  dtype=np.complex64),
+            "ring_nb":   np.zeros(N_FFT_NB,  dtype=np.complex64),
+            "td_buffer": np.zeros(TD_SAMPLES, dtype=np.complex64),
         }
 
         self._nb = ttk.Notebook(self)

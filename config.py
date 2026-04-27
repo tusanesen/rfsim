@@ -1,9 +1,10 @@
-FS        = 500_000      # Sample rate (Hz)
-N_FFT     = 4096         # FFT window size → ~122 Hz/bin
-CHUNK     = 512          # Samples per UDP packet
-F_LO      = 40_000       # Display window low edge (Hz)
-F_HI      = 240_000      # Display window high edge (Hz)
-NOISE_STD = 0.015        # AWGN amplitude
+FS                = 40_000_000      # 40 MHz IQ sample rate (complex64)
+N_FFT             = 4096            # ~9.8 kHz/bin at FS=40 MHz
+CHUNK             = 4096            # 32 KB packets (CHUNK * 8 bytes complex64)
+F_LO              = -20_000_000     # baseband display low edge  (signed Hz)
+F_HI              =  20_000_000     # baseband display high edge (signed Hz)
+DISPLAY_OFFSET_HZ = 150_000_000     # cosmetic: f_display = f_baseband + 150 MHz
+NOISE_STD         = 0.015           # complex AWGN amplitude
 
 UDP_HOST  = "127.0.0.1"
 UDP_PORT  = 12345
