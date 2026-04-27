@@ -1,8 +1,8 @@
-FS                = 40_000_000      # 40 MHz IQ sample rate (complex64)
-N_FFT             = 4096            # ~9.8 kHz/bin at FS=40 MHz
+FS                = 8_000_000       # 8 MHz IQ sample rate (complex64)
+N_FFT             = 4096            # ~1.95 kHz/bin at FS=8 MHz
 CHUNK             = 4096            # 32 KB packets (CHUNK * 8 bytes complex64)
-F_LO              = -20_000_000     # baseband display low edge  (signed Hz)
-F_HI              =  20_000_000     # baseband display high edge (signed Hz)
+F_LO              = -4_000_000      # baseband display low edge  (signed Hz)
+F_HI              =  4_000_000      # baseband display high edge (signed Hz)
 DISPLAY_OFFSET_HZ = 150_000_000     # cosmetic: f_display = f_baseband + 150 MHz
 NOISE_STD         = 0.015           # complex AWGN amplitude
 

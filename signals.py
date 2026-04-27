@@ -389,12 +389,12 @@ class ASKSignal(SignalBase):
 def default_signals() -> list:
     wavs = _list_wav_files()
     return [
-        AMSignal( "CH1", -15_000_000,  1_000, 0.50),
-        AMSignal( "CH2", -10_000_000,  2_500, 0.70),
-        AMSignal( "CH3",  -5_000_000,  5_000, 0.40),
-        FMSignal( "CH4",           0, 10_000, 8_000),
-        ASKSignal("CH5",   5_000_000,  2_000, 0.0),
-        AMSignal( "CH6",  10_000_000,  1_000, 0.85, wav_file=wavs[0] if wavs else _WAV_DEFAULT),
-        FMSignal( "CH7",  15_000_000,  5_000, 6_000,
+        AMSignal( "CH1", -3_500_000,  1_000, 0.50),
+        AMSignal( "CH2", -2_500_000,  2_500, 0.70),
+        AMSignal( "CH3", -1_500_000,  5_000, 0.40),
+        FMSignal( "CH4",          0, 10_000, 8_000),
+        ASKSignal("CH5",  1_500_000,  2_000, 0.0),
+        AMSignal( "CH6",  2_500_000,  1_000, 0.85, wav_file=wavs[0] if wavs else _WAV_DEFAULT),
+        FMSignal( "CH7",  3_500_000,  5_000, 6_000,
                   wav_file=wavs[1] if len(wavs) > 1 else _WAV_DEFAULT),
     ]

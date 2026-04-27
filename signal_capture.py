@@ -662,11 +662,11 @@ class ChannelCanvas(tk.Frame):
 
 # ── ParamPanel ─────────────────────────────────────────────────────────────────
 class ParamPanel(tk.Frame):
-    # WB BW range is wider now (sub-channels of the 40 MHz receiver).
+    # WB BW range covers up to the full receiver bandwidth (FS).
     # Limits in Hz; UI units differ per type to keep typing readable.
-    _BW_LIMITS = {"WB": (1_000_000, 40_000_000),     # 1-40 MHz
-                  "NB": (1_000,    200_000)}          # 1-200 kHz
-    _BW_UNITS  = {"WB": ("MHz", 1e6, "1"),            # (label_unit, scale, default)
+    _BW_LIMITS = {"WB": (100_000, 4_000_000),        # 0.1-4 MHz
+                  "NB": (1_000,   200_000)}          # 1-200 kHz
+    _BW_UNITS  = {"WB": ("MHz", 1e6, "2"),            # (label_unit, scale, default)
                   "NB": ("kHz", 1e3, "10")}
 
     def __init__(self, parent, ch_type: str, on_apply):
@@ -686,7 +686,7 @@ class ParamPanel(tk.Frame):
         if ch_type == "WB":
             fc_def_str = f"{fc_def_disp_mhz:g}"
         else:
-            fc_def_str = f"{fc_def_disp_mhz + 5:g}"   # 155 MHz default for NB
+            fc_def_str = f"{fc_def_disp_mhz + 1:g}"   # 151 MHz default for NB
 
         tk.Label(self, text=f"{ch_type} Receiver", bg=BG2, fg=hdr_col,
                  font=("Consolas", 10, "bold")).grid(
