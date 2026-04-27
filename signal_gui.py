@@ -197,6 +197,14 @@ class App(tk.Tk):
                                 fieldbackground=ENTRY_BG, background=BG3,
                                 foreground=FG, selectbackground=SEL_BG,
                                 selectforeground="white", arrowcolor=FG)
+                # Pin readonly+!focus colors so the value stays visible after
+                # the combobox loses focus (otherwise ttk falls back to system
+                # defaults and the text disappears against the dark field).
+                style.map("Dark.TCombobox",
+                          fieldbackground=[("readonly", ENTRY_BG)],
+                          foreground=[("readonly", FG)],
+                          selectbackground=[("readonly", "!focus", ENTRY_BG)],
+                          selectforeground=[("readonly", "!focus", FG)])
                 e = ttk.Combobox(self._type_frame, values=spec.choices,
                                  font=("Consolas", 9), width=20,
                                  state="readonly", style="Dark.TCombobox")

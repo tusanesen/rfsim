@@ -128,6 +128,16 @@ def ddc(ring: np.ndarray, fc_hz: float, bw_hz: float):
     return bb[::dec].astype(np.complex64), float(FS / dec)
 
 
+def _fmt_size(n_bytes: int) -> str:
+    if n_bytes < 1024:
+        return f"{n_bytes} B"
+    if n_bytes < 1024 * 1024:
+        return f"{n_bytes / 1024:.1f} KB"
+    if n_bytes < 1024 * 1024 * 1024:
+        return f"{n_bytes / 1024 / 1024:.1f} MB"
+    return f"{n_bytes / 1024 / 1024 / 1024:.2f} GB"
+
+
 # ── DDReceiver (streaming model + audio stream) ────────────────────────────────
 class DDReceiver:
     """
@@ -158,6 +168,7 @@ class DDReceiver:
         self._stream  = None
         self._rec_file: "IO | None" = None
         self._recording = False
+        self._rec_bytes = 0
 
     @property
     def playing(self):
@@ -166,6 +177,10 @@ class DDReceiver:
     @property
     def recording(self):
         return self._recording
+
+    @property
+    def rec_bytes(self) -> int:
+        return self._rec_bytes
 
     def configure(self, fc_hz: float, bw_hz: float):
         """Call whenever fc or BW changes. Resets streaming state; stops any recording."""
@@ -205,7 +220,9 @@ class DDReceiver:
 
         # Write raw IQ to file
         if self._recording and self._rec_file:
-            self._rec_file.write(bb_dec.tobytes())
+            payload = bb_dec.tobytes()
+            self._rec_file.write(payload)
+            self._rec_bytes += len(payload)
 
         # Feed audio if playing
         if self.mod_type and self._playing:
@@ -272,6 +289,7 @@ class DDReceiver:
         path = os.path.join(RECORDINGS_DIR, name)
         self._rec_file  = open(path, "wb")
         self._recording = True
+        self._rec_bytes = 0
         print(f"Recording IQ -> {name}")
 
     def stop_recording(self):
@@ -302,6 +320,7 @@ class DDRPanel(tk.LabelFrame):
         self._color      = color
         self._canvas_ref = canvas_ref
         self._linked     = linked     # True = NB mode; fc/bw come from channel
+        self._size_after_id = None
         self._build()
 
     def _build(self):
@@ -340,6 +359,13 @@ class DDRPanel(tk.LabelFrame):
                             background=BG3, foreground=FG,
                             selectbackground=SEL_BG, selectforeground="white",
                             arrowcolor=FG)
+            # ttk Combobox readonly+!focus state would otherwise inherit
+            # system default colors and the text disappears against the dark field.
+            style.map("DDR.TCombobox",
+                      fieldbackground=[("readonly", ENTRY_BG)],
+                      foreground=[("readonly", FG)],
+                      selectbackground=[("readonly", "!focus", ENTRY_BG)],
+                      selectforeground=[("readonly", "!focus", FG)])
             bw_cb = ttk.Combobox(bw_row, textvariable=self._bw_var,
                                   values=DDR_BW_CHOICES,
                                   font=("Consolas", 8), width=6,
@@ -382,6 +408,9 @@ class DDRPanel(tk.LabelFrame):
                                   cursor="hand2", state="disabled",
                                   command=self._toggle_rec)
         self._rec_btn.pack(side="left")
+        self._size_lbl = tk.Label(action_row, text="", bg=BG2, fg=FG_DIM,
+                                  font=("Consolas", 8))
+        self._size_lbl.pack(side="left", padx=(8, 0))
 
     def set_canvas(self, canvas):
         self._canvas_ref = canvas
@@ -390,12 +419,34 @@ class DDRPanel(tk.LabelFrame):
         """Called by ChannelTab when NB channel Apply fires (linked mode only)."""
         if self._ddr.recording:
             self._ddr.stop_recording()
-            self._rec_btn.config(text="Rec", bg=BG3, fg=FG_DIM)
-        self._rec_btn.config(state="normal")
-        mod = self._mod_var.get()
-        self._play_btn.config(
-            state="normal" if (mod != "--") else "disabled"
-        )
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        """Single source of truth for Play/Rec visual + enabled state."""
+        has_fc  = self._ddr.fc_hz is not None
+        has_mod = self._mod_var.get() != "--"
+
+        # Rec: enabled once fc is configured (IQ capture is mod-agnostic)
+        if self._ddr.recording:
+            self._rec_btn.config(state="normal", text="Stop",
+                                 bg="#FF4444", fg="white")
+        elif has_fc:
+            self._rec_btn.config(state="normal", text="Rec",
+                                 bg=BG3, fg=FG)
+        else:
+            self._rec_btn.config(state="disabled", text="Rec",
+                                 bg=BG3, fg=FG_DIM)
+
+        # Play: needs both fc and a real mod_type
+        if self._ddr.playing:
+            self._play_btn.config(state="normal", text="Stop",
+                                  bg=self._color, fg=BG)
+        elif has_fc and has_mod:
+            self._play_btn.config(state="normal", text="Play",
+                                  bg=BG3, fg=FG)
+        else:
+            self._play_btn.config(state="disabled", text="Play",
+                                  bg=BG3, fg=FG_DIM)
 
     def _apply(self):
         try:
@@ -407,41 +458,55 @@ class DDRPanel(tk.LabelFrame):
         bw_hz = float(self._bw_var.get()) * 1000
         # configure() stops any active recording (fc/bw changed = stale file)
         self._ddr.configure(fc_hz, bw_hz)
-        if self._ddr.recording:
-            self._rec_btn.config(text="Rec", bg=BG3, fg=FG_DIM)
-        # Rec button enabled as soon as fc is configured (IQ capture is mod-agnostic)
-        self._rec_btn.config(state="normal")
+        self._refresh_buttons()
         if self._canvas_ref:
             self._canvas_ref.update_ddr_marker(self._idx, fc_hz, bw_hz)
 
     def _on_mod_change(self, _=None):
         mod = self._mod_var.get()
         self._ddr.mod_type = mod if mod != "--" else None
-        enabled = (mod != "--") and (self._ddr.fc_hz is not None)
-        self._play_btn.config(state="normal" if enabled else "disabled")
-        if not enabled and self._ddr.playing:
+        if mod == "--" and self._ddr.playing:
             self._ddr.stop_playback()
-            self._play_btn.config(text="Play", bg=BG3, fg=FG_DIM)
+        self._refresh_buttons()
 
     def _toggle_play(self):
         if self._ddr.playing:
             self._ddr.stop_playback()
-            self._play_btn.config(text="Play", bg=BG3, fg=FG_DIM)
         else:
             if self._ddr.fc_hz is None or not self._ddr.mod_type:
                 return
             self._ddr.start_playback()
-            self._play_btn.config(text="Stop", bg=self._color, fg=BG)
+        self._refresh_buttons()
 
     def _toggle_rec(self):
         if self._ddr.recording:
             self._ddr.stop_recording()
-            self._rec_btn.config(text="Rec", bg=BG3, fg=FG_DIM)
+            self._refresh_buttons()
         else:
             if self._ddr.fc_hz is None:
                 return
             self._ddr.start_recording()
-            self._rec_btn.config(text="Stop", bg="#FF4444", fg="white")
+            self._refresh_buttons()
+            self._poll_rec_size()
+
+    def _poll_rec_size(self):
+        # Self-cancels when recording stops (covers external stops via configure()
+        # or on_channel_applied(), not just the Rec button toggle).
+        if not self._ddr.recording:
+            self._size_lbl.config(text="")
+            self._size_after_id = None
+            return
+        self._size_lbl.config(text=_fmt_size(self._ddr.rec_bytes))
+        self._size_after_id = self.after(500, self._poll_rec_size)
+
+    def destroy(self):
+        if self._size_after_id is not None:
+            try:
+                self.after_cancel(self._size_after_id)
+            except Exception:
+                pass
+            self._size_after_id = None
+        super().destroy()
 
     def _start_tune(self):
         if self._linked or not self._canvas_ref:
@@ -521,8 +586,9 @@ class ChannelCanvas(tk.Frame):
         hi_k = (fc_hz + bw_hz / 2) / 1000
         m["vline"].set_xdata([fc_k, fc_k])
         m["vline"].set_visible(True)
-        # axvspan has no simple setter; hide old and note span extent via xy
-        m["span"].set_xy([[lo_k, 0], [lo_k, 1], [hi_k, 1], [hi_k, 0], [lo_k, 0]])
+        # mpl >= 3.7: axvspan returns a Rectangle, not a Polygon — use x/width.
+        m["span"].set_x(lo_k)
+        m["span"].set_width(hi_k - lo_k)
         m["span"].set_visible(True)
         m["label"].set_x(fc_k)
         m["label"].set_visible(True)
@@ -624,6 +690,11 @@ class ParamPanel(tk.Frame):
                              background=BG3, foreground=FG,
                              selectbackground=SEL_BG, selectforeground="white",
                              arrowcolor=FG)
+        _fft_style.map("Param.TCombobox",
+                       fieldbackground=[("readonly", ENTRY_BG)],
+                       foreground=[("readonly", FG)],
+                       selectbackground=[("readonly", "!focus", ENTRY_BG)],
+                       selectforeground=[("readonly", "!focus", FG)])
         ttk.Combobox(self, textvariable=self._fft_var,
                      values=FFT_SIZE_CHOICES,
                      font=("Consolas", 9), width=8,
@@ -771,8 +842,6 @@ class OverviewTab(tk.Frame):
         super().__init__(parent, bg=BG)
         self._app        = app
         self._state      = state
-        self._btn_active = {n: False for n in CHANNEL_DEFS}
-        self._btns: dict[str, tk.Button] = {}
         self._got_signal = False
         self._build()
 
@@ -816,36 +885,6 @@ class OverviewTab(tk.Frame):
         canvas.get_tk_widget().pack(fill="both", expand=True)
         self._canvas = canvas
 
-        bot = tk.Frame(self, bg=BG3, pady=6)
-        bot.pack(fill="x", padx=10)
-        tk.Label(bot, text="Monitoring Receivers:", bg=BG3, fg=FG_DIM,
-                 font=("Consolas", 9)).pack(side="left", padx=(4, 12))
-        for name, defs in CHANNEL_DEFS.items():
-            color = defs["color"]
-            btn = tk.Button(
-                bot, text=name,
-                bg=BG2, fg=color,
-                activebackground=BG3, activeforeground=color,
-                relief="flat", font=("Consolas", 9, "bold"),
-                padx=12, pady=3, cursor="hand2", bd=0,
-                command=lambda n=name: self._toggle(n),
-            )
-            btn.pack(side="left", padx=4)
-            self._btns[name] = btn
-
-    def _toggle(self, name: str):
-        active = not self._btn_active[name]
-        self._btn_active[name] = active
-        defs  = CHANNEL_DEFS[name]
-        color = defs["color"]
-        btn   = self._btns[name]
-        if active:
-            btn.config(bg=color, fg=BG)
-            self._app.activate_channel(name, defs["ch_type"], color)
-        else:
-            btn.config(bg=BG2, fg=color)
-            self._app.deactivate_channel(name)
-
     def update(self, updated: bool):
         if not updated:
             return
@@ -855,6 +894,200 @@ class OverviewTab(tk.Frame):
         mag = _spectrum(self._state["ring_wb"], _WIN_WB, N_FFT_WB)
         self._spec_line.set_data(OV_FREQS, mag[_ov_mask])
         self._td_line.set_ydata(self._state["td_buffer"])
+        self._canvas.draw_idle()
+
+
+# ── RecordingsTab ──────────────────────────────────────────────────────────────
+def _parse_iq_filename(name: str) -> tuple[float | None, float | None]:
+    """Parse (fc_hz, sr_hz) from IQ_<fc>kHz_SR<sr>kHz_<ts>.bin filenames."""
+    try:
+        parts = name.split("_")
+        fc_part, sr_part = parts[1], parts[2]
+        if (not fc_part.endswith("kHz")
+                or not sr_part.startswith("SR")
+                or not sr_part.endswith("kHz")):
+            return None, None
+        return float(fc_part[:-3]) * 1000, float(sr_part[2:-3]) * 1000
+    except (IndexError, ValueError):
+        return None, None
+
+
+class RecordingsTab(tk.Frame):
+    _MAX_DISP_SAMPLES = 50_000   # cap for time-domain plots
+    _FFT_N            = 8192     # window size for the magnitude-spectrum plot
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self._files: list[str] = []
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        # Left column: file list + refresh + info
+        left = tk.Frame(self, bg=BG2, width=300)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+
+        header = tk.Frame(left, bg=BG2)
+        header.pack(fill="x", padx=6, pady=(8, 4))
+        tk.Label(header, text="IQ Recordings", bg=BG2, fg=FG,
+                 font=("Consolas", 10, "bold")).pack(side="left")
+        tk.Button(header, text="Refresh", command=self.refresh,
+                  bg=BG3, fg=FG,
+                  activebackground=BG3, activeforeground=FG,
+                  relief="flat", bd=0, padx=8, pady=2,
+                  font=("Consolas", 8), cursor="hand2"
+                  ).pack(side="right")
+
+        list_frame = tk.Frame(left, bg=BG2)
+        list_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        sb = tk.Scrollbar(list_frame, orient="vertical",
+                          bg=BG3, troughcolor=BG2, width=8)
+        sb.pack(side="right", fill="y")
+        self._listbox = tk.Listbox(
+            list_frame, bg=BG3, fg=FG,
+            selectbackground=SEL_BG, selectforeground="white",
+            activestyle="none",
+            font=("Consolas", 8), bd=0, relief="flat",
+            highlightthickness=0,
+            yscrollcommand=sb.set,
+        )
+        self._listbox.pack(side="left", fill="both", expand=True)
+        sb.config(command=self._listbox.yview)
+        self._listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        self._info = tk.Label(left, text="Select a file to visualize.",
+                              bg=BG2, fg=FG_DIM,
+                              font=("Consolas", 8), justify="left",
+                              wraplength=280, anchor="w")
+        self._info.pack(fill="x", padx=6, pady=(0, 8))
+
+        # Right column: plots
+        fig = plt.Figure(figsize=(9, 6), facecolor="#0d0d0d")
+        gs  = gridspec.GridSpec(3, 1, figure=fig, hspace=0.55,
+                                left=0.08, right=0.97,
+                                top=0.94, bottom=0.07)
+        self._ax_t = fig.add_subplot(gs[0])
+        self._ax_s = fig.add_subplot(gs[1])
+        self._ax_m = fig.add_subplot(gs[2])
+        self._style_axes_default()
+
+        canvas = FigureCanvasTkAgg(fig, master=self)
+        canvas.get_tk_widget().pack(side="left", fill="both", expand=True)
+        self._canvas = canvas
+
+    def _style_axes_default(self):
+        for ax, title, xlabel, ylabel in (
+            (self._ax_t, "I (cyan) & Q (magenta) vs time",
+             "Time (ms)", "Amplitude"),
+            (self._ax_s, "Magnitude spectrum (baseband)",
+             "Frequency (kHz)", "dBFS"),
+            (self._ax_m, "Magnitude |IQ| vs time",
+             "Time (ms)", "|IQ|"),
+        ):
+            ax.set_facecolor("#111111")
+            ax.tick_params(colors="gray", labelsize=7)
+            ax.grid(True, color="#2a2a2a", linewidth=0.5)
+            ax.set_title(title, color="#888888", fontsize=9)
+            ax.set_xlabel(xlabel, color="gray", fontsize=8)
+            ax.set_ylabel(ylabel, color="gray", fontsize=8)
+
+    def refresh(self):
+        prev = None
+        sel  = self._listbox.curselection()
+        if sel:
+            prev = self._files[sel[0]]
+
+        self._listbox.delete(0, tk.END)
+        self._files = []
+        if not os.path.isdir(RECORDINGS_DIR):
+            return
+        try:
+            entries = sorted(
+                (n for n in os.listdir(RECORDINGS_DIR) if n.endswith(".bin")),
+                reverse=True,
+            )
+        except OSError:
+            return
+        for name in entries:
+            self._files.append(name)
+            self._listbox.insert(tk.END, name)
+
+        if prev and prev in self._files:
+            idx = self._files.index(prev)
+            self._listbox.selection_set(idx)
+            self._listbox.see(idx)
+
+    def _on_select(self, _evt=None):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        name = self._files[sel[0]]
+        path = os.path.join(RECORDINGS_DIR, name)
+        try:
+            size_b = os.path.getsize(path)
+        except OSError as e:
+            self._info.config(text=f"Error: {e}")
+            return
+
+        total_samples = size_b // 8        # complex64 = 8 bytes/sample
+        if total_samples == 0:
+            self._info.config(text=f"{name}\n(empty file)")
+            return
+
+        _, sr = _parse_iq_filename(name)
+        if sr is None or sr <= 0:
+            sr = 1.0   # fallback so the time axis is at least sample-indexed
+
+        # Read just enough for the visualisation so multi-GB files stay snappy.
+        n_to_read = min(total_samples,
+                        max(self._MAX_DISP_SAMPLES, self._FFT_N))
+        try:
+            iq = np.fromfile(path, dtype=np.complex64, count=n_to_read)
+        except OSError as e:
+            self._info.config(text=f"Error: {e}")
+            return
+
+        dur_s = total_samples / sr
+        self._info.config(text=(
+            f"file: {name}\n"
+            f"samples: {total_samples:,}\n"
+            f"SR: {sr/1000:.1f} kHz\n"
+            f"duration: {dur_s:.3f} s\n"
+            f"size: {_fmt_size(size_b)}"
+        ))
+
+        self._draw_plots(iq, sr)
+
+    def _draw_plots(self, iq: np.ndarray, sr: float):
+        n      = iq.size
+        n_disp = min(n, self._MAX_DISP_SAMPLES)
+        t_ms   = np.arange(n_disp) / sr * 1000
+
+        ax = self._ax_t
+        ax.clear()
+        ax.plot(t_ms, iq.real[:n_disp], color="#00BFFF", linewidth=0.6, label="I")
+        ax.plot(t_ms, iq.imag[:n_disp], color="#FF6FCF", linewidth=0.6, label="Q")
+        ax.legend(facecolor=BG2, edgecolor=BG3, labelcolor=FG,
+                  fontsize=7, loc="upper right")
+
+        fft_n = min(n, self._FFT_N)
+        seg   = iq[:fft_n]
+        win   = np.blackman(fft_n)
+        X     = np.fft.fftshift(np.fft.fft(seg * win))
+        mag   = 20 * np.log10(np.abs(X) / fft_n + 1e-12)
+        f_khz = np.fft.fftshift(np.fft.fftfreq(fft_n, 1 / sr)) / 1000
+
+        ax = self._ax_s
+        ax.clear()
+        ax.plot(f_khz, mag, color="#00FF9F", linewidth=0.7)
+
+        ax = self._ax_m
+        ax.clear()
+        ax.plot(t_ms, np.abs(iq[:n_disp]), color="#FFD700", linewidth=0.6)
+
+        # Re-apply axis styling (cleared by ax.clear())
+        self._style_axes_default()
         self._canvas.draw_idle()
 
 
@@ -885,6 +1118,17 @@ class ReceiverApp(tk.Tk):
         self._overview = OverviewTab(self._nb, app=self, state=self._state)
         self._nb.add(self._overview, text="  Overview  ")
 
+        for name, defs in CHANNEL_DEFS.items():
+            tab = ChannelTab(self._nb, name=name, ch_type=defs["ch_type"],
+                             color=defs["color"], state=self._state)
+            self._channels[name] = tab
+            self._nb.add(tab, text=f"  {name}  ")
+
+        self._recordings = RecordingsTab(self._nb)
+        self._nb.add(self._recordings, text="  Recordings  ")
+
+        self._nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
         rx = threading.Thread(
             target=_receiver_thread,
             args=(self._pkt_queue, self._stop_event),
@@ -904,22 +1148,6 @@ class ReceiverApp(tk.Tk):
         s.map("TNotebook.Tab",
               background=[("selected", BG)],
               foreground=[("selected", FG)])
-
-    def activate_channel(self, name: str, ch_type: str, color: str):
-        if name in self._channels:
-            return
-        tab = ChannelTab(self._nb, name=name, ch_type=ch_type,
-                         color=color, state=self._state)
-        self._channels[name] = tab
-        self._nb.add(tab, text=f"  {name}  ")
-        self._nb.select(tab)
-
-    def deactivate_channel(self, name: str):
-        if name not in self._channels:
-            return
-        tab = self._channels.pop(name)
-        self._nb.forget(tab)
-        tab.destroy()
 
     def _poll(self):
         updated = False
@@ -945,6 +1173,13 @@ class ReceiverApp(tk.Tk):
             ch.update()
 
         self.after(INTERVAL_MS, self._poll)
+
+    def _on_tab_change(self, _e=None):
+        sel = self._nb.select()
+        if not sel:
+            return
+        if self._nb.nametowidget(sel) is self._recordings:
+            self._recordings.refresh()
 
     def _on_close(self):
         self._stop_event.set()
